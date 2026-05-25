@@ -12,7 +12,7 @@ from io import BytesIO
 from colorthief import ColorThief
 import numpy as np
 
-st.set_page_config(page_title="Minero Multinicho Pro v3.9", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Minero Multinicho Pro v4.0", page_icon="🧠", layout="wide")
 
 
 class YouTubeHyperMiner:
@@ -32,7 +32,7 @@ class YouTubeHyperMiner:
                 if "(" in clean_text:
                     clean_text = clean_text[clean_text.find("(")+1:clean_text.rfind(")")]
                 data = json.loads(clean_text)
-                return [item[0] for item in data[1] if item[0] != keyword]
+                return [item[0] for item in data[1] if item[0].lower() != keyword.lower()]
         except Exception:
             pass
         return []
@@ -194,6 +194,108 @@ class YouTubeHyperMiner:
             return int(clean)
         except ValueError:
             return 0
+
+
+def generar_keywords_red_autocomplete(miner, semillas_iniciales, max_keywords=250, profundidad=3):
+    keywords = []
+    vistos = set()
+    pendientes = []
+
+    stopwords = {
+        "the", "and", "for", "with", "from", "this", "that", "your", "you",
+        "how", "why", "what", "when", "where", "who", "is", "are", "was",
+        "were", "to", "in", "of", "a", "an", "on", "by", "about", "all",
+        "full", "video", "videos", "official", "new", "best", "top"
+    }
+
+    expansores_base = list("abcdefghijklmnopqrstuvwxyz") + [
+        "2024", "2025", "2026",
+        "explained", "theory", "story", "ending", "secret", "secrets",
+        "characters", "timeline", "facts", "hidden details", "things you missed",
+        "review", "breakdown", "analysis", "vs", "ranking", "truth"
+    ]
+
+    def limpiar_kw(kw):
+        return re.sub(r"\s+", " ", str(kw).lower().strip())
+
+    def add_keyword(kw):
+        kw = limpiar_kw(kw)
+        if kw and kw not in vistos and len(kw) > 2:
+            vistos.add(kw)
+            keywords.append(kw)
+            pendientes.append(kw)
+
+    def extraer_conceptos(frase):
+        frase = limpiar_kw(frase)
+        palabras = re.findall(r"\w+", frase)
+        palabras_filtradas = [p for p in palabras if p not in stopwords and len(p) > 2]
+
+        conceptos = []
+        conceptos.extend(palabras_filtradas)
+
+        for i in range(len(palabras_filtradas) - 1):
+            conceptos.append(f"{palabras_filtradas[i]} {palabras_filtradas[i + 1]}")
+
+        for i in range(len(palabras_filtradas) - 2):
+            conceptos.append(f"{palabras_filtradas[i]} {palabras_filtradas[i + 1]} {palabras_filtradas[i + 2]}")
+
+        return conceptos
+
+    for semilla in semillas_iniciales:
+        semilla = limpiar_kw(semilla)
+        add_keyword(semilla)
+
+        for exp in expansores_base:
+            add_keyword(f"{semilla} {exp}")
+
+    nivel = 0
+
+    while pendientes and len(keywords) < max_keywords and nivel < profundidad:
+        ronda = pendientes[:]
+        pendientes = []
+
+        for kw in ronda:
+            if len(keywords) >= max_keywords:
+                break
+
+            consultas = [kw]
+
+            for exp in expansores_base[:35]:
+                consultas.append(f"{kw} {exp}")
+
+            for consulta in consultas:
+                if len(keywords) >= max_keywords:
+                    break
+
+                sugerencias = miner.get_youtube_suggestions(consulta)
+
+                for sug in sugerencias:
+                    if len(keywords) >= max_keywords:
+                        break
+
+                    sug = limpiar_kw(sug)
+                    add_keyword(sug)
+
+                    conceptos = extraer_conceptos(sug)
+
+                    for concepto in conceptos:
+                        if len(keywords) >= max_keywords:
+                            break
+
+                        add_keyword(concepto)
+
+                        for semilla in semillas_iniciales:
+                            semilla = limpiar_kw(semilla)
+                            add_keyword(f"{semilla} {concepto}")
+                            add_keyword(f"{concepto} explained")
+                            add_keyword(f"{concepto} theory")
+                            add_keyword(f"{concepto} story")
+
+                time.sleep(0.03)
+
+        nivel += 1
+
+    return keywords[:max_keywords]
 
 
 def parse_number_label(texto):
@@ -426,8 +528,6 @@ def resumen_validacion_final(tabla_referencias, tabla_validacion):
         score += 7
         motivos.append("Hay alguna referencia reciente.")
 
-    altas = 0
-    medias = 0
     validaciones_fuertes = 0
 
     if not tabla_validacion.empty:
@@ -499,43 +599,6 @@ def generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acu
         for palabra, _ in Counter(palabras).most_common(30):
             candidatos.append(palabra)
 
-        bigramas = []
-        trigramas = []
-
-        for fuente in textos_fuente:
-            clean_t = re.sub(r'[^\w\s]', ' ', fuente.lower())
-            tokens = [p for p in clean_t.split() if p not in stopwords and p not in palabras_semilla and len(p) > 2]
-
-            for i in range(len(tokens) - 1):
-                bigramas.append(f"{tokens[i]} {tokens[i + 1]}")
-            for i in range(len(tokens) - 2):
-                trigramas.append(f"{tokens[i]} {tokens[i + 1]} {tokens[i + 2]}")
-
-        for frase, _ in Counter(bigramas).most_common(25):
-            candidatos.append(frase)
-        for frase, _ in Counter(trigramas).most_common(20):
-            candidatos.append(frase)
-
-    if guiones_acumulados:
-        texto_guiones = " ".join([g["Texto"] for g in guiones_acumulados]).lower()
-        conceptos_guion = extraer_conceptos_de_texto(texto_guiones, limite=30)
-
-        for palabra, _ in conceptos_guion:
-            if palabra not in palabras_semilla:
-                candidatos.append(palabra)
-
-    miner = YouTubeHyperMiner()
-    semillas_base = []
-
-    for semilla in semillas_iniciales:
-        semillas_base.append(semilla)
-        sugerencias = miner.get_youtube_suggestions(semilla)
-
-        for sug in sugerencias[:10]:
-            sug_limpia = sug.lower().strip()
-            if sug_limpia and sug_limpia not in semillas_base:
-                semillas_base.append(sug_limpia)
-
     nichos = []
     plantillas_vecinas = [
         "{} explained", "{} theory", "{} secrets", "{} story", "{} analysis",
@@ -548,16 +611,6 @@ def generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acu
         if candidato:
             for plantilla in plantillas_vecinas:
                 nichos.append(plantilla.format(candidato))
-
-    for semilla in semillas_base:
-        nichos.extend([
-            f"{semilla} similar topics",
-            f"{semilla} hidden details",
-            f"{semilla} things you missed",
-            f"{semilla} characters explained",
-            f"{semilla} ending explained",
-            f"{semilla} theories"
-        ])
 
     nichos_limpios = []
     vistos = set()
@@ -735,8 +788,7 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
         if "story" in t:
             patrones_detectados.append("story")
 
-    patrones = Counter(patrones_detectados).most_common()
-    formatos_prioritarios = [p for p, _ in patrones]
+    formatos_prioritarios = [p for p, _ in Counter(patrones_detectados).most_common()]
 
     bancos_formatos = {
         "100_days": [
@@ -804,12 +856,6 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     for t in top_temas:
         temas_finales.append(t)
 
-    if nichos_similares:
-        for n in nichos_similares[:10]:
-            partes = n.split()
-            if len(partes) >= 2:
-                temas_finales.append(" ".join(partes[:2]))
-
     temas_limpios = []
     vistos = set()
 
@@ -844,19 +890,22 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     return ideas[:limite]
 
 
-st.title("♾️ Minero Pro v3.9: Motor Universal Multi-Nicho")
-st.markdown("Busca en mercado ingles, detecta outliers, valida nichos, analiza guiones, miniaturas e ideas de ataque.")
+st.title("♾️ Minero Pro v4.0: Motor Universal Multi-Nicho")
+st.markdown("Busca keywords en red, detecta outliers, valida nichos, analiza guiones, miniaturas e ideas de ataque.")
 
 st.sidebar.header("⚙️ Configuración")
 input_raw = st.sidebar.text_area("Palabras Semilla (Sepáralas con comas):", value="how to train your dragon")
 outlier_factor = st.sidebar.slider("Sensibilidad del Filtro (x)", 1.1, 5.0, 1.2, step=0.1)
-max_ciclos = st.sidebar.slider("Tope maximo de ramas totales:", 2, 40, 15)
+max_ciclos = st.sidebar.slider("Tope maximo de ramas totales:", 2, 120, 50)
 max_guiones = st.sidebar.slider("Videos buenos para analizar guion:", 1, 10, 5)
+max_keywords_expansion = st.sidebar.slider("Keywords reales máximas:", 50, 500, 250)
+profundidad_keywords = st.sidebar.slider("Profundidad de red:", 1, 4, 3)
 
 if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_width=True):
     st.session_state.outliers_data = []
     st.session_state.guiones_data = []
     st.session_state.nichos_similares = []
+    st.session_state.keywords_generadas = []
 
     historico_outliers = []
     keywords_procesadas = set()
@@ -865,30 +914,20 @@ if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_
     miner = YouTubeHyperMiner()
     semillas_iniciales = [k.strip().lower() for k in input_raw.split(",") if k.strip()]
 
-    cola_keywords = []
-
-    for semilla in semillas_iniciales:
-        if semilla not in cola_keywords:
-            cola_keywords.append(semilla)
-
-        sugerencias_base = miner.get_youtube_suggestions(semilla)
-
-        for sug in sugerencias_base:
-            if sug not in cola_keywords:
-                cola_keywords.append(sug)
-
-        mods_universales = [
-            " theory", " story", " secret", " analysis", " 2026",
-            " explained", " ending", " facts", " breakdown", " review"
-        ]
-
-        for mod in mods_universales:
-            frase_mod = f"{semilla}{mod}"
-            if frase_mod not in cola_keywords:
-                cola_keywords.append(frase_mod)
-
     status_box = st.empty()
     progress_bar = st.progress(0)
+
+    status_box.info("🧬 Expandiendo keywords en red con autocomplete de YouTube...")
+
+    cola_keywords = generar_keywords_red_autocomplete(
+        miner,
+        semillas_iniciales,
+        max_keywords=max_keywords_expansion,
+        profundidad=profundidad_keywords
+    )
+
+    st.session_state.keywords_generadas = cola_keywords
+
     ciclo_actual = 0
     total_ramas_encontradas = min(len(cola_keywords), max_ciclos)
 
@@ -953,6 +992,16 @@ if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_
     st.session_state.outliers_data = historico_outliers
     st.session_state.guiones_data = guiones_acumulados
     st.session_state.nichos_similares = nichos_similares
+
+
+if "keywords_generadas" in st.session_state and st.session_state.keywords_generadas:
+    with st.expander("🧬 Keywords generadas por la expansión en red", expanded=False):
+        st.write(f"Total generadas: {len(st.session_state.keywords_generadas)}")
+        st.text_area(
+            "Keywords encontradas:",
+            value=", ".join(st.session_state.keywords_generadas),
+            height=180
+        )
 
 
 if "outliers_data" in st.session_state and st.session_state.outliers_data:
