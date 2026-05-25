@@ -2,3 +2,6 @@ streamlit
 requests
 pandas
 youtube-transcript-api
+pillow
+colorthief
+numpy
