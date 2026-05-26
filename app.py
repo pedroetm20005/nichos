@@ -2,18 +2,547 @@ import streamlit as st
 import requests
 import json
 import re
+import sqlite3
+import time
+import html
 import pandas as pd
+import numpy as np
 from urllib.parse import quote
 from collections import Counter
-import time
-from youtube_transcript_api import YouTubeTranscriptApi
-from PIL import Image
+from pathlib import Path
+from datetime import datetime
 from io import BytesIO
+from PIL import Image
 from colorthief import ColorThief
-import numpy as np
+from youtube_transcript_api import YouTubeTranscriptApi
 
-st.set_page_config(page_title="Minero Multinicho Pro v4.0", page_icon="🧠", layout="wide")
 
+st.set_page_config(
+    page_title="Minero Multinicho Pro v4.0",
+    page_icon="🧠",
+    layout="wide"
+)
+
+
+# =========================================================
+# MEMORIA IA
+# =========================================================
+
+class PatternMemory:
+    def __init__(self, db_path="data/pattern_memory.sqlite"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.setup()
+
+    def setup(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                seeds TEXT,
+                final_score REAL,
+                auto_score REAL,
+                reading TEXT,
+                color_rgb TEXT,
+                total_videos INTEGER,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pattern_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER,
+                pattern_type TEXT,
+                pattern_value TEXT,
+                weight REAL,
+                created_at TEXT
+            );
+        """)
+        self.conn.commit()
+
+    def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
+        if df_total is None or df_total.empty:
+            return None
+
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        seeds_text = ", ".join(seeds) if isinstance(seeds, list) else str(seeds)
+
+        cur = self.conn.execute("""
+            INSERT INTO analyses
+            (created_at, seeds, final_score, auto_score, reading, color_rgb, total_videos, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now,
+            seeds_text,
+            float(final_score),
+            float(auto_score),
+            str(reading),
+            json.dumps(tuple(int(x) for x in color_rgb)),
+            int(len(df_total)),
+            notes
+        ))
+
+        analysis_id = cur.lastrowid
+
+        for _, row in df_total.iterrows():
+            weight = self.video_weight(row)
+            for pattern_type, pattern_value in self.extract_video_patterns(row):
+                self.conn.execute("""
+                    INSERT INTO pattern_events
+                    (analysis_id, pattern_type, pattern_value, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (analysis_id, pattern_type, pattern_value, weight, now))
+
+        for idea in ideas or []:
+            for pattern_type, pattern_value in self.extract_title_patterns(str(idea)):
+                self.conn.execute("""
+                    INSERT INTO pattern_events
+                    (analysis_id, pattern_type, pattern_value, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (analysis_id, "idea_" + pattern_type, pattern_value, final_score / 100, now))
+
+        self.conn.commit()
+        return analysis_id
+
+    def predict_opportunity(self, seeds, df_total, color_rgb=None, ideas=None):
+        history_count = self.conn.execute("SELECT COUNT(*) AS total FROM analyses").fetchone()["total"]
+
+        if history_count < 3:
+            return {
+                "score": None,
+                "label": "Memoria insuficiente",
+                "confidence": "Baja",
+                "motives": [f"Hay {history_count} análisis guardados. Guarda al menos 3 para empezar a predecir."],
+                "winning_patterns": []
+            }
+
+        current = Counter()
+
+        if df_total is not None and not df_total.empty:
+            for _, row in df_total.head(20).iterrows():
+                for key in self.extract_video_patterns(row):
+                    current[key] += 1
+
+        for idea in ideas or []:
+            for key in self.extract_title_patterns(str(idea)):
+                current[key] += 1
+
+        if color_rgb:
+            current[("color_family", self.color_family(color_rgb))] += 2
+
+        stats = self.pattern_stats()
+        matched = []
+
+        for pattern, count in current.items():
+            s = stats.get(pattern)
+            if not s or s["uses"] < 2:
+                continue
+
+            matched.append({
+                "pattern": pattern,
+                "count": count,
+                "avg_weight": s["avg_weight"],
+                "uses": s["uses"],
+                "impact": s["avg_weight"] * min(count, 3)
+            })
+
+        if not matched:
+            return {
+                "score": 45,
+                "label": "Nicho testeable",
+                "confidence": "Baja",
+                "motives": ["No hay patrones históricos parecidos suficientes."],
+                "winning_patterns": []
+            }
+
+        impact = sum(m["impact"] for m in matched)
+        coverage = min(len(matched) / 10, 1)
+        score = int(max(0, min(100, 35 + impact * 18 + coverage * 20)))
+
+        if score >= 75:
+            label = "Alta probabilidad según memoria"
+        elif score >= 58:
+            label = "Prometedor según memoria"
+        elif score >= 42:
+            label = "Testeable según memoria"
+        else:
+            label = "Débil según memoria"
+
+        confidence = "Alta" if len(matched) >= 8 else "Media" if len(matched) >= 4 else "Baja"
+
+        return {
+            "score": score,
+            "label": label,
+            "confidence": confidence,
+            "motives": [
+                f"Coinciden {len(matched)} patrones con la memoria histórica.",
+                f"Confianza {confidence.lower()} basada en {history_count} análisis guardados."
+            ],
+            "winning_patterns": sorted(matched, key=lambda x: x["impact"], reverse=True)[:8]
+        }
+
+    def leaderboard(self, limit=30):
+        return pd.read_sql_query("""
+            SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+            FROM pattern_events
+            GROUP BY pattern_type, pattern_value
+            HAVING uses >= 2
+            ORDER BY avg_weight DESC, uses DESC
+            LIMIT ?
+        """, self.conn, params=(limit,))
+
+    def recent_analyses(self, limit=10):
+        return pd.read_sql_query("""
+            SELECT created_at, seeds, final_score, auto_score, reading, total_videos
+            FROM analyses
+            ORDER BY id DESC
+            LIMIT ?
+        """, self.conn, params=(limit,))
+
+    def extract_video_patterns(self, row):
+        title = str(row.get("Title", ""))
+        keyword = str(row.get("Keyword_Origen", ""))
+        published = str(row.get("Published", "")).lower()
+
+        patterns = []
+        patterns.extend(self.extract_title_patterns(title))
+
+        for token in self.important_tokens(keyword):
+            patterns.append(("keyword_token", token))
+
+        if "hour" in published or "day" in published:
+            patterns.append(("recency", "fresh_48h"))
+        elif "week" in published:
+            patterns.append(("recency", "fresh_weeks"))
+        elif "month" in published:
+            patterns.append(("recency", "recent_months"))
+
+        return patterns
+
+    def extract_title_patterns(self, title):
+        clean = self.clean(title)
+        words = self.important_tokens(clean)
+        patterns = []
+
+        for word in words[:12]:
+            patterns.append(("title_token", word))
+
+        for i in range(len(words) - 1):
+            patterns.append(("title_bigram", f"{words[i]} {words[i + 1]}"))
+
+        rules = {
+            "why": r"\bwhy\b",
+            "secret": r"\b(secret|hidden|truth)\b",
+            "versus": r"\bvs\b|\bversus\b",
+            "story": r"\b(story|history|rise|fall)\b",
+            "challenge": r"\b(challenge|hardest|impossible)\b",
+            "survival": r"\b(survive|survived|survival)\b",
+            "ranking": r"\b(best|top|ranking|tier)\b",
+            "explainer": r"\b(explained|analysis|breakdown)\b",
+            "curiosity_gap": r"\b(nobody|no one|unexpected|weird|strange)\b",
+        }
+
+        for name, pattern in rules.items():
+            if re.search(pattern, clean):
+                patterns.append(("title_format", name))
+
+        return patterns
+
+    def pattern_stats(self):
+        rows = self.conn.execute("""
+            SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+            FROM pattern_events
+            GROUP BY pattern_type, pattern_value
+        """).fetchall()
+
+        stats = {}
+        for row in rows:
+            stats[(row["pattern_type"], row["pattern_value"])] = {
+                "uses": int(row["uses"]),
+                "avg_weight": float(row["avg_weight"])
+            }
+
+        return stats
+
+    def video_weight(self, row):
+        multiplier = float(row.get("Multiplicador", 0) or 0)
+        views = int(row.get("Views", 0) or 0)
+        published = str(row.get("Published", "")).lower()
+
+        weight = min(multiplier / 5, 1)
+
+        if views >= 500000:
+            weight += 0.25
+        elif views >= 100000:
+            weight += 0.15
+        elif views >= 30000:
+            weight += 0.07
+
+        if "hour" in published or "day" in published or "week" in published:
+            weight += 0.15
+
+        return max(0.05, min(weight, 1.5))
+
+    def color_family(self, rgb):
+        r, g, b = [int(x) for x in rgb]
+        brightness = (r + g + b) / 3
+
+        if brightness < 70:
+            tone = "dark"
+        elif brightness > 180:
+            tone = "light"
+        else:
+            tone = "mid"
+
+        if r >= g and r >= b:
+            hue = "warm"
+        elif b >= r and b >= g:
+            hue = "cold"
+        elif g >= r and g >= b:
+            hue = "green"
+        else:
+            hue = "neutral"
+
+        return f"{tone}_{hue}"
+
+    def important_tokens(self, text):
+        stopwords = {
+            "the", "and", "for", "with", "from", "this", "that", "your", "you",
+            "how", "why", "what", "when", "where", "who", "are", "was", "were",
+            "into", "about", "video", "videos", "official", "full", "new", "best",
+            "top", "review", "analysis", "explained", "breakdown", "para", "como",
+            "esta", "este", "pero", "porque", "todo", "algo", "nada"
+        }
+
+        clean = self.clean(text)
+        return [w for w in clean.split() if w not in stopwords and len(w) > 3]
+
+    def clean(self, text):
+        text = str(text).lower()
+        text = re.sub(r"[^\w\s]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+
+def format_pattern(pattern_item):
+    pattern_type, pattern_value = pattern_item["pattern"]
+    return f"{pattern_type}: {pattern_value}"
+
+
+memoria = PatternMemory("data/pattern_memory.sqlite")
+
+
+# =========================================================
+# ESTILO VISUAL
+# =========================================================
+
+def inject_css():
+    st.markdown("""
+    <style>
+    .stApp {
+        background: radial-gradient(circle at 50% 0%, #171f31 0, #0b101b 38%, #080d16 100%);
+        color: #f7f8fc;
+    }
+
+    .block-container {
+        max-width: 1700px;
+        padding-top: 12px;
+        padding-left: 28px;
+        padding-right: 28px;
+    }
+
+    [data-testid="stSidebar"] {
+        background: #080d16;
+        border-right: 1px solid rgba(255,255,255,.10);
+    }
+
+    [data-testid="stSidebar"] * {
+        color: #f7f8fc;
+    }
+
+    .top-banner {
+        background: #ffd21f;
+        color: #05070d;
+        font-weight: 900;
+        text-align: center;
+        padding: 12px 18px;
+        border-radius: 8px;
+        margin-bottom: 24px;
+    }
+
+    .page-title {
+        font-size: 34px;
+        line-height: 1;
+        font-weight: 950;
+        margin: 28px 0 22px;
+    }
+
+    .chips {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin: 18px 0 34px;
+    }
+
+    .chip {
+        background: #427cf4;
+        color: white;
+        border-radius: 999px;
+        padding: 8px 13px;
+        font-size: 15px;
+        font-weight: 800;
+    }
+
+    .video-card-fixed {
+        width: 100%;
+        min-width: 0;
+        margin-bottom: 28px;
+    }
+
+    .thumb-wrap-fixed {
+        position: relative;
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #141b29;
+        box-shadow: 0 14px 36px rgba(0,0,0,.28);
+        text-decoration: none;
+    }
+
+    .thumb-wrap-fixed img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+    }
+
+    .duration-fixed {
+        position: absolute;
+        right: 7px;
+        bottom: 7px;
+        background: rgba(0,0,0,.88);
+        color: white;
+        border-radius: 6px;
+        padding: 3px 6px;
+        font-size: 12px;
+        font-weight: 900;
+    }
+
+    .card-title-row-fixed {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 9px;
+        align-items: start;
+        margin-top: 12px;
+    }
+
+    .score-badge {
+        color: white;
+        border-radius: 8px;
+        padding: 5px 8px;
+        font-size: 14px;
+        line-height: 1;
+        font-weight: 950;
+        white-space: nowrap;
+    }
+
+    .score-hot { background: #ff2f63; }
+    .score-mid { background: #a24be8; }
+    .score-low { background: #3f7df4; }
+
+    .video-title-fixed {
+        color: #f7f8fc;
+        font-size: 17px;
+        line-height: 1.22;
+        font-weight: 950;
+        overflow: hidden;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+    }
+
+    .meta-fixed {
+        color: #8d98aa;
+        font-size: 13px;
+        line-height: 1.35;
+        margin-top: 7px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def compact_number(value):
+    try:
+        value = float(value)
+    except Exception:
+        return "0"
+
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    return str(int(value))
+
+
+def score_class(multiplier):
+    try:
+        multiplier = float(multiplier)
+    except Exception:
+        multiplier = 0
+
+    if multiplier >= 8:
+        return "score-hot"
+    if multiplier >= 4:
+        return "score-mid"
+    return "score-low"
+
+
+def render_video_card(row):
+    title = html.escape(str(row.get("Title", "Sin titulo")))
+    channel = html.escape(str(row.get("Channel", "Canal")))
+    subs = html.escape(str(row.get("Subscribers", "Unknown")))
+    url = html.escape(str(row.get("URL", "#")))
+    thumb = html.escape(str(row.get("Thumbnail", "")))
+    published = html.escape(str(row.get("Published", "")))
+    views = compact_number(row.get("Views", 0))
+    multiplier = float(row.get("Multiplicador", 0) or 0)
+    badge_class = score_class(multiplier)
+
+    st.markdown(f"""
+    <div class="video-card-fixed">
+        <a class="thumb-wrap-fixed" href="{url}" target="_blank">
+            <img src="{thumb}" alt="{title}">
+            <span class="duration-fixed">outlier</span>
+        </a>
+        <div class="card-title-row-fixed">
+            <span class="score-badge {badge_class}">{multiplier:.1f}x</span>
+            <div class="video-title-fixed">{title}</div>
+        </div>
+        <div class="meta-fixed">
+            {channel} · {subs} subs<br>
+            {views} views · {published}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_outlier_cards(df_total):
+    df = df_total.sort_values("Multiplicador", ascending=False).head(30)
+
+    for start in range(0, len(df), 5):
+        cols = st.columns(5, gap="large")
+        bloque = df.iloc[start:start + 5]
+
+        for col, (_, row) in zip(cols, bloque.iterrows()):
+            with col:
+                render_video_card(row)
+
+
+# =========================================================
+# MINERO YOUTUBE
+# =========================================================
 
 class YouTubeHyperMiner:
     def __init__(self):
@@ -44,8 +573,8 @@ class YouTubeHyperMiner:
         try:
             response = requests.get(search_url, headers=self.headers, timeout=12)
             if response.status_code == 200:
-                html = response.text
-                json_match = re.search(r'var ytInitialData = ({.*?});</script>', html)
+                html_text = response.text
+                json_match = re.search(r'var ytInitialData = ({.*?});</script>', html_text)
 
                 if json_match:
                     yt_data = json.loads(json_match.group(1))
@@ -99,7 +628,7 @@ class YouTubeHyperMiner:
         except Exception:
             pass
 
-        return [] if not videos else videos
+        return videos
 
     def extract_script_keywords(self, video_id):
         try:
@@ -159,7 +688,7 @@ class YouTubeHyperMiner:
                 self.subs_cache[video_id] = "Unknown"
                 return "Unknown"
 
-            html = response.text
+            html_text = response.text
 
             patterns = [
                 r'"ownerSubCountText":\{"simpleText":"([^"]+)"\}',
@@ -169,7 +698,7 @@ class YouTubeHyperMiner:
             ]
 
             for pattern in patterns:
-                match = re.search(pattern, html)
+                match = re.search(pattern, html_text)
                 if match:
                     subs = match.group(1)
                     self.subs_cache[video_id] = subs
@@ -183,7 +712,7 @@ class YouTubeHyperMiner:
             return "Unknown"
 
     def _parse_views(self, text):
-        clean = re.sub(r'[^\d\.KMBkmb]', '', text)
+        clean = re.sub(r'[^\d\.KMBkmb]', '', str(text))
         if not clean:
             return 0
         try:
@@ -195,6 +724,10 @@ class YouTubeHyperMiner:
         except ValueError:
             return 0
 
+
+# =========================================================
+# FUNCIONES DE ANALISIS
+# =========================================================
 
 def generar_keywords_red_autocomplete(miner, semillas_iniciales, max_keywords=250, profundidad=3):
     keywords = []
@@ -275,7 +808,6 @@ def generar_keywords_red_autocomplete(miner, semillas_iniciales, max_keywords=25
 
                     sug = limpiar_kw(sug)
                     add_keyword(sug)
-
                     conceptos = extraer_conceptos(sug)
 
                     for concepto in conceptos:
@@ -325,35 +857,66 @@ def parse_number_label(texto):
     return int(num)
 
 
-def fecha_es_buena(published):
+def published_age_days(published):
     if not isinstance(published, str):
-        return False
+        return None
 
-    p = published.lower()
+    p = published.lower().strip()
+    match = re.search(r"(\d+)", p)
+    n = int(match.group(1)) if match else 1
 
-    if "hour" in p or "day" in p or "week" in p:
-        return True
+    if "hour" in p or "hora" in p:
+        return 0
+    if "day" in p or "dia" in p or "día" in p:
+        return n
+    if "week" in p or "semana" in p:
+        return n * 7
+    if "month" in p or "mes" in p:
+        return n * 30
+    if "year" in p or "año" in p:
+        return n * 365
 
-    match = re.search(r"(\d+)\s+month", p)
-    if match:
-        return int(match.group(1)) <= 6
+    return None
 
-    return False
+
+def filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_subs):
+    df = df_total.copy()
+
+    if periodo_publicacion == "Últimos 3 meses":
+        df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 90)]
+    elif periodo_publicacion == "Últimos 6 meses":
+        df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 180)]
+    elif periodo_publicacion == "Cualquier reciente":
+        df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 365)]
+
+    if rango_subs == "Canales pequeños 0 - 100K":
+        df = df[df["Subscribers"].apply(lambda s: 0 < parse_number_label(s) <= 100000)]
+    elif rango_subs == "0 - 500K":
+        df = df[df["Subscribers"].apply(lambda s: 0 < parse_number_label(s) <= 500000)]
+
+    return df.sort_values(by="Multiplicador", ascending=False)
+
+
+def fecha_es_buena(published):
+    age = published_age_days(published)
+    return age is not None and age <= 180
 
 
 def recency_points(published):
-    if not isinstance(published, str):
+    age = published_age_days(published)
+
+    if age is None:
         return 0
-
-    p = published.lower()
-
-    if "hour" in p or "day" in p:
+    if age <= 2:
         return 20
-    if "week" in p:
+    if age <= 14:
         return 18
-    if "month" in p:
+    if age <= 90:
         return 12
-    return 5
+    if age <= 180:
+        return 7
+
+    return 3
 
 
 def extraer_conceptos_de_texto(texto, limite=12):
@@ -369,7 +932,7 @@ def extraer_conceptos_de_texto(texto, limite=12):
         'entonces', 'hacer', 'todo', 'algo', 'nada', 'cuando'
     }
 
-    palabras = texto.split()
+    palabras = str(texto).split()
     palabras_filtradas = [p for p in palabras if p not in stopwords and len(p) > 4]
     return Counter(palabras_filtradas).most_common(limite)
 
@@ -388,7 +951,7 @@ def evaluar_destaca(row):
         motivos.append(f"multiplicador fuerte ({multi:.1f}x)")
 
     if subs > 0 and views >= subs:
-        motivos.append("mas vistas que subs del canal")
+        motivos.append("más vistas que subs del canal")
 
     if subs > 0 and views >= subs * 2:
         motivos.append("duplica o supera los subs")
@@ -528,27 +1091,11 @@ def resumen_validacion_final(tabla_referencias, tabla_validacion):
         score += 7
         motivos.append("Hay alguna referencia reciente.")
 
-    validaciones_fuertes = 0
-
     if not tabla_validacion.empty:
         altas = len(tabla_validacion[tabla_validacion["Prioridad"] == "Alta"])
         medias = len(tabla_validacion[tabla_validacion["Prioridad"] == "Media"])
 
-        for _, row in tabla_validacion.iterrows():
-            hay_3 = str(row.get("¿Hay 3 videos ref.?", "")).lower()
-            pequeno = bool(row.get("¿Alguno es de un canal pequeño?", False))
-            prioridad = row.get("Prioridad", "")
-
-            if ("sí" in hay_3 or "si" in hay_3) and pequeno and prioridad == "Alta":
-                validaciones_fuertes += 1
-
-        if validaciones_fuertes >= 2:
-            score += 25
-            motivos.append("Hay varias ideas con 3 referencias, canal pequeño y prioridad alta.")
-        elif validaciones_fuertes >= 1:
-            score += 18
-            motivos.append("Hay una idea clara con 3 referencias, canal pequeño y prioridad alta.")
-        elif altas >= 1:
+        if altas >= 1:
             score += 12
             motivos.append("Hay al menos una idea en prioridad alta.")
         elif medias >= 2:
@@ -588,7 +1135,6 @@ def generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acu
 
     if historico_outliers:
         df_temp = pd.DataFrame(historico_outliers).drop_duplicates(subset=["URL"])
-
         textos_fuente = []
         textos_fuente.extend(df_temp["Title"].tolist())
         textos_fuente.extend(df_temp["Keyword_Origen"].tolist())
@@ -733,7 +1279,7 @@ def calcular_score_oportunidad(df_total):
     return min(score, 100), motivos
 
 
-def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
+def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=20):
     textos_titulos = df_total["Title"].tolist()
     texto = " ".join(textos_titulos).lower()
 
@@ -758,14 +1304,12 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     for titulo in textos_titulos:
         clean = re.sub(r'[^\w\s]', ' ', titulo.lower())
         words = [w for w in clean.split() if w not in stopwords and len(w) > 3]
-
         for i in range(len(words) - 1):
             bigramas.append(f"{words[i]} {words[i + 1]}")
 
     top_bigramas = [b for b, _ in Counter(bigramas).most_common(15)]
 
     patrones_detectados = []
-
     for titulo in textos_titulos:
         t = titulo.lower()
 
@@ -791,51 +1335,15 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     formatos_prioritarios = [p for p, _ in Counter(patrones_detectados).most_common()]
 
     bancos_formatos = {
-        "100_days": [
-            "I Spent 100 Days Inside {}",
-            "100 Days Trying to Master {}",
-            "I Survived 100 Days With Only {}"
-        ],
-        "build": [
-            "I Built a {} That Should Not Exist",
-            "I Built the Most Dangerous {}",
-            "I Built {} and Instantly Regretted It"
-        ],
-        "survival": [
-            "I Tried to Survive {}",
-            "Surviving the Hardest {} Challenge",
-            "{} Survival Gets Worse Every Minute"
-        ],
-        "secret": [
-            "The Hidden Truth About {}",
-            "The Secret Side of {}",
-            "What Nobody Tells You About {}"
-        ],
-        "why": [
-            "Why {} Is Taking Over YouTube",
-            "Why Everyone Suddenly Cares About {}",
-            "Why {} Works So Well"
-        ],
-        "versus": [
-            "{} vs The Most Impossible Challenge",
-            "I Compared {} With Its Biggest Rival",
-            "{} vs Everything That Tries to Stop It"
-        ],
-        "escalation": [
-            "{} Gets Harder Every Minute",
-            "{} But Every Step Makes It Worse",
-            "I Tried {}, But It Kept Escalating"
-        ],
-        "ignored": [
-            "Nobody Talks About {}",
-            "The {} Everyone Ignored",
-            "No One Expected {} To Work"
-        ],
-        "story": [
-            "The Complete Story of {}",
-            "The Rise and Fall of {}",
-            "The Strange History of {}"
-        ],
+        "100_days": ["I Spent 100 Days Inside {}", "100 Days Trying to Master {}", "I Survived 100 Days With Only {}"],
+        "build": ["I Built a {} That Should Not Exist", "I Built the Most Dangerous {}", "I Built {} and Instantly Regretted It"],
+        "survival": ["I Tried to Survive {}", "Surviving the Hardest {} Challenge", "{} Survival Gets Worse Every Minute"],
+        "secret": ["The Hidden Truth About {}", "The Secret Side of {}", "What Nobody Tells You About {}"],
+        "why": ["Why {} Is Taking Over YouTube", "Why Everyone Suddenly Cares About {}", "Why {} Works So Well"],
+        "versus": ["{} vs The Most Impossible Challenge", "I Compared {} With Its Biggest Rival", "{} vs Everything That Tries to Stop It"],
+        "escalation": ["{} Gets Harder Every Minute", "{} But Every Step Makes It Worse", "I Tried {}, But It Kept Escalating"],
+        "ignored": ["Nobody Talks About {}", "The {} Everyone Ignored", "No One Expected {} To Work"],
+        "story": ["The Complete Story of {}", "The Rise and Fall of {}", "The Strange History of {}"],
         "default": [
             "I Tested {} So You Don't Have To",
             "The Truth About {}",
@@ -849,12 +1357,8 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     }
 
     temas_finales = []
-
-    for b in top_bigramas:
-        temas_finales.append(b)
-
-    for t in top_temas:
-        temas_finales.append(t)
+    temas_finales.extend(top_bigramas)
+    temas_finales.extend(top_temas)
 
     temas_limpios = []
     vistos = set()
@@ -876,10 +1380,8 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
 
     for tema in temas_limpios:
         tema_titulo = tema.title()
-
         for formato in formatos:
             idea = formato.format(tema_titulo)
-
             if idea not in usados:
                 usados.add(idea)
                 ideas.append(idea)
@@ -890,18 +1392,46 @@ def generar_ideas_ataque(df_total, guiones_data, nichos_similares, limite=14):
     return ideas[:limite]
 
 
-st.title("♾️ Minero Pro v4.0: Motor Universal Multi-Nicho")
-st.markdown("Busca keywords en red, detecta outliers, valida nichos, analiza guiones, miniaturas e ideas de ataque.")
+def crear_tabla_canales_validados(df_total):
+    filas = []
 
-st.sidebar.header("⚙️ Configuración")
-input_raw = st.sidebar.text_area("Palabras Semilla (Sepáralas con comas):", value="how to train your dragon")
-outlier_factor = st.sidebar.slider("Sensibilidad del Filtro (x)", 1.1, 5.0, 1.2, step=0.1)
-max_ciclos = st.sidebar.slider("Tope maximo de ramas totales:", 2, 120, 50)
-max_guiones = st.sidebar.slider("Videos buenos para analizar guion:", 1, 10, 5)
-max_keywords_expansion = st.sidebar.slider("Keywords reales máximas:", 50, 500, 250)
-profundidad_keywords = st.sidebar.slider("Profundidad de red:", 1, 4, 3)
+    for canal, grupo in df_total.groupby("Channel"):
+        grupo = grupo.sort_values("Multiplicador", ascending=False)
+        subs = grupo["Subscribers"].iloc[0] if "Subscribers" in grupo else "Unknown"
+        subs_num = parse_number_label(subs)
+        max_multi = float(grupo["Multiplicador"].max())
+        total_views = int(grupo["Views"].sum())
+        videos = int(len(grupo))
 
-if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_width=True):
+        if 0 < subs_num <= 100000 and max_multi >= 3:
+            prioridad = "Alta"
+        elif max_multi >= 2 or total_views >= 100000:
+            prioridad = "Media"
+        else:
+            prioridad = "Baja"
+
+        filas.append({
+            "Canal": canal,
+            "Subs": subs,
+            "Videos outlier": videos,
+            "Mejor multiplicador": round(max_multi, 1),
+            "Vistas outlier": total_views,
+            "Prioridad": prioridad,
+            "Mejor video": grupo["Title"].iloc[0],
+            "Link": grupo["URL"].iloc[0]
+        })
+
+    if not filas:
+        return pd.DataFrame()
+
+    tabla = pd.DataFrame(filas)
+    prioridad_order = {"Alta": 0, "Media": 1, "Baja": 2}
+    tabla["_orden"] = tabla["Prioridad"].map(prioridad_order).fillna(9)
+    tabla = tabla.sort_values(["_orden", "Mejor multiplicador", "Vistas outlier"], ascending=[True, False, False])
+    return tabla.drop(columns=["_orden"])
+
+
+def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords):
     st.session_state.outliers_data = []
     st.session_state.guiones_data = []
     st.session_state.nichos_similares = []
@@ -913,10 +1443,10 @@ if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_
 
     miner = YouTubeHyperMiner()
     semillas_iniciales = [k.strip().lower() for k in input_raw.split(",") if k.strip()]
+    st.session_state.semillas_iniciales = semillas_iniciales
 
     status_box = st.empty()
     progress_bar = st.progress(0)
-
     status_box.info("🧬 Expandiendo keywords en red con autocomplete de YouTube...")
 
     cola_keywords = generar_keywords_red_autocomplete(
@@ -988,105 +1518,181 @@ if st.sidebar.button("⚡ Iniciar Bucle de Profundidad Absoluta", use_container_
 
     nichos_similares = generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acumulados, limite=40)
 
-    status_box.success("🎉 ¡Mapeo completado con exito!")
+    status_box.success("🎉 ¡Mapeo completado con éxito!")
     st.session_state.outliers_data = historico_outliers
     st.session_state.guiones_data = guiones_acumulados
     st.session_state.nichos_similares = nichos_similares
 
 
+# =========================================================
+# APP
+# =========================================================
+
+inject_css()
+
+st.sidebar.markdown("## Minero Pro")
+st.sidebar.caption("Filtros del radar")
+
+st.sidebar.markdown("### OUTLIERS")
+outlier_factor = st.sidebar.slider("Outlier score mínimo", 1.1, 5.0, 1.2, step=0.1)
+periodo_publicacion = st.sidebar.selectbox("Publication date", ["Últimos 3 meses", "Últimos 6 meses", "Cualquier reciente"])
+rango_subs = st.sidebar.selectbox("Subscribers", ["Canales pequeños 0 - 100K", "0 - 500K", "Cualquiera"])
+
+st.sidebar.markdown("### RAMAS / RED")
+max_ciclos = st.sidebar.slider("Ramas totales", 2, 120, 50)
+max_keywords_expansion = st.sidebar.slider("Keywords reales máximas", 50, 500, 250)
+profundidad_keywords = st.sidebar.slider("Profundidad de red", 1, 4, 3)
+max_guiones = st.sidebar.slider("Videos buenos para guion", 1, 10, 5)
+
+st.sidebar.markdown("### MEMORIA")
+guardar_en_memoria = st.sidebar.checkbox("Guardar análisis en memoria IA", value=True)
+ver_memoria = st.sidebar.checkbox("Ver memoria aprendida", value=False)
+
+st.markdown("""
+<div class="top-banner">
+    Minero Multinicho Pro: encuentra outliers, valida nichos y guarda patrones en memoria IA
+</div>
+""", unsafe_allow_html=True)
+
+nicho_default = st.session_state.get("nicho_buscado", "how to train your dragon")
+
+input_raw = st.text_input(
+    "Buscador de nicho",
+    value=nicho_default,
+    placeholder="Escribe el nicho: how to train your dragon, roblox horror, shorts ai..."
+)
+
+st.markdown(f"""
+<div class="chips">
+    <span class="chip">Outlier Score {outlier_factor:.1f}x+ x</span>
+    <span class="chip">Ramas red {max_ciclos} x</span>
+    <span class="chip">Keywords {max_keywords_expansion} x</span>
+    <span class="chip">Profundidad {profundidad_keywords} x</span>
+    <span class="chip">Guiones {max_guiones} x</span>
+</div>
+""", unsafe_allow_html=True)
+
+col_run, col_random, col_saved = st.columns([1.2, 1, 4])
+
+with col_run:
+    buscar = st.button("Buscar nicho", use_container_width=True)
+
+with col_random:
+    random_click = st.button("Random", use_container_width=True)
+
+with col_saved:
+    st.caption(f"Filtros activos: {periodo_publicacion} · {rango_subs}")
+
+if random_click:
+    input_raw = "viral ai shorts, roblox horror, minecraft survival, dragon theory"
+    st.session_state.nicho_buscado = input_raw
+
+if buscar or random_click:
+    st.session_state.nicho_buscado = input_raw
+    run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords)
+
 if "keywords_generadas" in st.session_state and st.session_state.keywords_generadas:
     with st.expander("🧬 Keywords generadas por la expansión en red", expanded=False):
         st.write(f"Total generadas: {len(st.session_state.keywords_generadas)}")
-        st.text_area(
-            "Keywords encontradas:",
-            value=", ".join(st.session_state.keywords_generadas),
-            height=180
+        st.text_area("Keywords encontradas:", value=", ".join(st.session_state.keywords_generadas), height=180)
+
+if not st.session_state.get("outliers_data"):
+    st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho. Los videos que salgan aquí serán outliers.")
+    st.stop()
+
+df_total = pd.DataFrame(st.session_state.outliers_data)
+df_total = df_total.drop_duplicates(subset=["URL"]).sort_values(by="Multiplicador", ascending=False)
+
+if "Subscribers" not in df_total.columns:
+    df_total["Subscribers"] = "Unknown"
+
+df_total["Subscribers"] = df_total["Subscribers"].fillna("Unknown")
+
+df_total_sin_filtros = df_total.copy()
+df_total = filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_subs)
+
+if df_total.empty:
+    st.warning(
+        f"Hay {len(df_total_sin_filtros)} outliers encontrados, pero ninguno pasa los filtros actuales: "
+        f"{periodo_publicacion} · {rango_subs}. Abre el filtro de meses/subs para verlos."
+    )
+    st.stop()
+
+score_auto, motivos_auto = calcular_score_oportunidad(df_total)
+tabla_referencias = crear_tabla_referencias(df_total)
+tabla_validacion = crear_tabla_validacion(df_total)
+tabla_canales = crear_tabla_canales_validados(df_total)
+
+ideas = generar_ideas_ataque(
+    df_total,
+    st.session_state.get("guiones_data", []),
+    st.session_state.get("nichos_similares", []),
+    limite=20
+)
+
+color_patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+
+tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_memoria = st.tabs([
+    "Videos outliers",
+    "Nicho",
+    "Ideas validadas",
+    "Canales validados",
+    "Memoria IA"
+])
+
+with tab_outliers:
+    st.markdown('<div class="page-title">All outliers</div>', unsafe_allow_html=True)
+    render_outlier_cards(df_total)
+
+    with st.expander("Ver tabla completa de outliers"):
+        st.dataframe(
+            df_total[
+                [
+                    "Keyword_Origen",
+                    "Title",
+                    "Channel",
+                    "Subscribers",
+                    "Views",
+                    "Published",
+                    "Multiplicador",
+                    "URL"
+                ]
+            ],
+            use_container_width=True
         )
 
+with tab_nicho:
+    st.markdown("## Validación del nicho")
+    st.warning("Si ves Subs canal como Hidden/Unknown, puedes escribirlos a mano. Ejemplo: 25K, 80K, 1.2M.")
 
-if "outliers_data" in st.session_state and st.session_state.outliers_data:
-    df_total = pd.DataFrame(st.session_state.outliers_data)
-    df_total = df_total.drop_duplicates(subset=["URL"]).sort_values(by="Multiplicador", ascending=False)
+    st.markdown("### Tabla de ideas de los canales referencia")
 
-    if "Subscribers" not in df_total.columns:
-        df_total["Subscribers"] = "Unknown"
+    tabla_referencias_editada = st.data_editor(
+        tabla_referencias,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "¿Destaca?": st.column_config.SelectboxColumn("¿Destaca?", options=["Sí", "No"], required=True),
+            "Link": st.column_config.LinkColumn("Link"),
+            "Subs canal": st.column_config.TextColumn("Subs canal"),
+            "¿Por qué llama la atención?": st.column_config.TextColumn("¿Por qué llama la atención?")
+        },
+        key="tabla_referencias_editor"
+    )
 
-    df_total["Subscribers"] = df_total["Subscribers"].fillna("Unknown")
+    st.markdown("### Tabla de validación de ideas")
 
-    def clasificar(m):
-        if m >= 3.0:
-            return "💥 BOMBAZO"
-        elif m >= 2.0:
-            return "🔥 MINA DE ORO"
-        return "📈 PROMETEDOR"
-
-    df_total["Potencial"] = df_total["Multiplicador"].apply(clasificar)
-
-    st.markdown("## 📈 Videos Outliers Detectados")
-
-    render_df = df_total.copy()
-    render_df["Subscribers"] = render_df["Subscribers"].fillna("Unknown")
-    render_df["Views"] = render_df["Views"].map('{:,.0f}'.format)
-    render_df["Multiplicador"] = render_df["Multiplicador"].map('{:,.1f}x'.format)
-
-    columnas_tabla = [
-        "Potencial", "Keyword_Origen", "Title", "Channel", "Subscribers",
-        "Views", "Published", "Multiplicador", "URL"
-    ]
-
-    st.dataframe(render_df[columnas_tabla], use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("## 🧠 Inteligencia de Oportunidad")
-
-    score_auto, motivos_auto = calcular_score_oportunidad(df_total)
-
-    tabla_referencias = crear_tabla_referencias(df_total)
-    tabla_validacion = crear_tabla_validacion(df_total)
-
-    with st.expander("📋 Ver / editar validacion real del nicho", expanded=True):
-        st.warning("Si ves Subs canal como Hidden/Unknown, puedes escribirlos a mano. Ejemplo: 25K, 80K, 1.2M. La nota final usara lo que edites aqui.")
-
-        st.markdown("### Tabla de ideas de los canales referencia")
-        tabla_referencias_editada = st.data_editor(
-            tabla_referencias,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "¿Destaca?": st.column_config.SelectboxColumn(
-                    "¿Destaca?",
-                    options=["Sí", "No"],
-                    required=True
-                ),
-                "Link": st.column_config.LinkColumn("Link"),
-                "Subs canal": st.column_config.TextColumn("Subs canal"),
-                "¿Por qué llama la atención?": st.column_config.TextColumn("¿Por qué llama la atención?")
-            },
-            key="tabla_referencias_editor"
-        )
-
-        st.markdown("### Tabla de validacion de ideas")
-        tabla_validacion_editada = st.data_editor(
-            tabla_validacion,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "¿Hay 3 videos ref.?": st.column_config.SelectboxColumn(
-                    "¿Hay 3 videos ref.?",
-                    options=["Sí", "No"],
-                    required=True
-                ),
-                "Prioridad": st.column_config.SelectboxColumn(
-                    "Prioridad",
-                    options=["Alta", "Media", "Baja"],
-                    required=True
-                ),
-                "¿Alguno es de un canal pequeño?": st.column_config.CheckboxColumn(
-                    "¿Alguno es de un canal pequeño?"
-                )
-            },
-            key="tabla_validacion_editor"
-        )
+    tabla_validacion_editada = st.data_editor(
+        tabla_validacion,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "¿Hay 3 videos ref.?": st.column_config.SelectboxColumn("¿Hay 3 videos ref.?", options=["Sí", "No"], required=True),
+            "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["Alta", "Media", "Baja"], required=True),
+            "¿Alguno es de un canal pequeño?": st.column_config.CheckboxColumn("¿Alguno es de un canal pequeño?")
+        },
+        key="tabla_validacion_editor"
+    )
 
     score_final, lectura_final, motivos_finales = resumen_validacion_final(
         tabla_referencias_editada,
@@ -1096,42 +1702,60 @@ if "outliers_data" in st.session_state and st.session_state.outliers_data:
     col_score1, col_score2, col_score3 = st.columns(3)
     col_score1.metric("Nota final del nicho", f"{score_final}/100")
     col_score2.metric("Resultado", lectura_final)
-    col_score3.metric("Score automatico bruto", f"{score_auto}/100")
+    col_score3.metric("Score automático bruto", f"{score_auto}/100")
 
     st.markdown("**Motivos de la nota final:**")
     for m in motivos_finales:
         st.write(f"- {m}")
 
     if motivos_auto:
-        with st.expander("Ver señales automaticas extra"):
-            for m in motivos_auto:
-                st.write(f"- {m}")
+        st.markdown("**Señales automáticas extra:**")
+        for m in motivos_auto:
+            st.write(f"- {m}")
 
-    ideas = generar_ideas_ataque(
-        df_total,
-        st.session_state.get("guiones_data", []),
-        st.session_state.get("nichos_similares", []),
-        limite=14
-    )
+    st.markdown("### 🧭 Nichos similares para seguir excavando")
 
-    st.markdown("### 🎯 Ideas de video")
-    st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=220)
+    if "nichos_similares" in st.session_state and st.session_state.nichos_similares:
+        st.text_area(
+            "Copia estos nichos/ramas para una nueva búsqueda:",
+            value=", ".join(st.session_state.nichos_similares),
+            height=130
+        )
 
-    st.markdown("### 🖼️ Direccion de miniatura")
-    color_patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+        cols_nichos = st.columns(3)
+        for i, nicho in enumerate(st.session_state.nichos_similares[:15]):
+            with cols_nichos[i % 3]:
+                st.code(nicho)
+    else:
+        st.info("Aún no hay suficientes señales para sugerir nichos similares.")
+
+    st.markdown("### 🖼️ Dirección de miniatura")
     st.write(f"Color dominante detectado: RGB {color_patron}")
 
     for instruccion in generar_direccion_miniatura(df_total, color_patron):
         st.write(f"- {instruccion}")
 
-    st.markdown("---")
-    st.markdown("## 🧠 Cajas de Extraccion Rapida")
+    st.markdown("### 🎨 Generador de base de miniatura basado en datos")
+
+    if st.button("Analizar miniaturas ganadoras y generar base"):
+        patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+        st.write(f"Patrón de color detectado: {patron}")
+        base_img = crear_base_miniatura(patron)
+        st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
+
+with tab_ideas:
+    st.markdown("## Ideas validadas")
+
+    st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=260)
+
+    st.markdown("## 🧠 Cajas de extracción rápida")
 
     c1, c2 = st.columns(2)
     semilla_referencia = df_total["Keyword_Origen"].iloc[0] if not df_total.empty else "video"
 
     with c1:
-        st.markdown("### 🔗 Basado en Titulos Ganadores")
+        st.markdown("### 🔗 Basado en títulos ganadores")
+
         titulos_buenos = df_total["Title"].tolist()
         stopwords_titulos = {
             'the', 'is', 'and', 'to', 'in', 'of', 'a', 'for', 'with', 'on',
@@ -1143,58 +1767,28 @@ if "outliers_data" in st.session_state and st.session_state.outliers_data:
         for t in titulos_buenos:
             clean_t = re.sub(r'[^\w\s]', '', t.lower())
             palabras = [p for p in clean_t.split() if p not in stopwords_titulos and len(p) > 2]
+
             for i in range(len(palabras) - 1):
                 bigramas.append(f"{palabras[i]} {palabras[i + 1]}")
 
         top_bi = Counter(bigramas).most_common(8)
         sug_titulos_caja = [f"{semilla_referencia} {token}" for token, _ in top_bi]
-        st.text_area("📋 Patrones de Titulos:", value=", ".join(list(dict.fromkeys(sug_titulos_caja))), height=100)
+
+        st.text_area("📋 Patrones de títulos:", value=", ".join(list(dict.fromkeys(sug_titulos_caja))), height=100)
 
     with c2:
-        st.markdown("### 📖 Basado en lo Hablado en Guiones")
+        st.markdown("### 📖 Basado en lo hablado en guiones")
 
         if "guiones_data" in st.session_state and st.session_state.guiones_data:
             texto_global = " ".join([g["Texto"] for g in st.session_state.guiones_data])
             conceptos_guion = extraer_conceptos_de_texto(texto_global, limite=10)
             sug_guion_caja = [f"{semilla_referencia} {palabra}" for palabra, _ in conceptos_guion]
-            st.text_area("📋 Palabras clave del Guion:", value=", ".join(list(dict.fromkeys(sug_guion_caja))), height=100)
+
+            st.text_area("📋 Palabras clave del guion:", value=", ".join(list(dict.fromkeys(sug_guion_caja))), height=100)
         else:
-            st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
+            st.info("No hay suficientes transcripciones procesadas aún en esta tanda.")
 
-    st.markdown("---")
-    st.markdown("## 🧭 Nichos Similares Para Seguir Excavando")
-
-    if "nichos_similares" in st.session_state and st.session_state.nichos_similares:
-        st.text_area(
-            "Copia estos nichos/ramas para una nueva busqueda:",
-            value=", ".join(st.session_state.nichos_similares),
-            height=130
-        )
-
-        cols_nichos = st.columns(3)
-        for i, nicho in enumerate(st.session_state.nichos_similares[:15]):
-            with cols_nichos[i % 3]:
-                st.code(nicho)
-    else:
-        st.info("Aun no hay suficientes señales para sugerir nichos similares.")
-
-    st.markdown("---")
-    st.markdown("## 🖼️ Miniaturas Ganadoras del Nicho")
-
-    thumbs_df = df_total.head(12).copy()
-    cols = st.columns(3)
-
-    for i, (_, row) in enumerate(thumbs_df.iterrows()):
-        with cols[i % 3]:
-            subs = row["Subscribers"] if "Subscribers" in row and pd.notna(row["Subscribers"]) else "Unknown"
-
-            st.image(row["Thumbnail"], use_container_width=True)
-            st.markdown(f"**{row['Title']}**")
-            st.caption(f"{row['Channel']} · {subs} subs · {row['Views']:,.0f} views · {row['Multiplicador']:.1f}x · {row['Published']}")
-            st.markdown(f"[Abrir video]({row['URL']})")
-
-    st.markdown("---")
-    st.markdown("## 📖 Radar de Transcripciones")
+    st.markdown("## 📖 Radar de transcripciones")
 
     if "guiones_data" in st.session_state and st.session_state.guiones_data:
         for i, guion in enumerate(st.session_state.guiones_data, start=1):
@@ -1213,14 +1807,14 @@ if "outliers_data" in st.session_state and st.session_state.outliers_data:
                     nuevas_busquedas = [f"{keyword_base_guion} {palabra}" for palabra, _ in conceptos[:8]]
 
                     st.text_area(
-                        "Nuevas busquedas sugeridas desde esta transcripcion:",
+                        "Nuevas búsquedas sugeridas desde esta transcripción:",
                         value=", ".join(nuevas_busquedas),
                         height=80,
                         key=f"ideas_guion_{i}"
                     )
 
                 st.text_area(
-                    "Fragmento de transcripcion:",
+                    "Fragmento de transcripción:",
                     value=guion["Texto"][:2500],
                     height=180,
                     key=f"preview_guion_{i}"
@@ -1228,17 +1822,71 @@ if "outliers_data" in st.session_state and st.session_state.outliers_data:
     else:
         st.info("No hay transcripciones disponibles en esta tanda.")
 
-    st.markdown("---")
-    st.markdown("## 🎨 Generador de Base de Miniatura Basado en Datos")
+with tab_canales:
+    st.markdown("## Canales validados")
 
-    if st.button("Analizar miniaturas ganadoras y generar base"):
-        urls = df_total.head(12)["Thumbnail"].tolist()
-        patron = analizar_patron_ganador(urls)
+    if tabla_canales.empty:
+        st.info("Aún no hay canales validados.")
+    else:
+        st.dataframe(
+            tabla_canales,
+            use_container_width=True,
+            column_config={"Link": st.column_config.LinkColumn("Link")}
+        )
 
-        st.write(f"Patron de color detectado: {patron}")
+with tab_memoria:
+    st.markdown("## Memoria IA")
 
-        base_img = crear_base_miniatura(patron)
-        st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
+    semillas_para_memoria = st.session_state.get(
+        "semillas_iniciales",
+        [k.strip().lower() for k in input_raw.split(",") if k.strip()]
+    )
 
-else:
-    st.info("Introduce una palabra raiz a la izquierda y arranca el motor profundo.")
+    prediccion_memoria = memoria.predict_opportunity(
+        semillas_para_memoria,
+        df_total,
+        color_patron,
+        ideas
+    )
+
+    if prediccion_memoria["score"] is None:
+        st.info(prediccion_memoria["motives"][0])
+    else:
+        c_mem1, c_mem2, c_mem3 = st.columns(3)
+
+        c_mem1.metric("Score memoria", f'{prediccion_memoria["score"]}/100')
+        c_mem2.metric("Lectura memoria", prediccion_memoria["label"])
+        c_mem3.metric("Confianza", prediccion_memoria["confidence"])
+
+        for motivo in prediccion_memoria["motives"]:
+            st.write(f"- {motivo}")
+
+        if prediccion_memoria["winning_patterns"]:
+            st.markdown("**Patrones históricos que empujan a favor:**")
+
+            for p in prediccion_memoria["winning_patterns"]:
+                st.write(f'- {format_pattern(p)} | peso {p["avg_weight"]:.2f} | usos {p["uses"]}')
+
+    if guardar_en_memoria:
+        if st.button("💾 Guardar resultado en memoria IA"):
+            score_final_mem, lectura_final_mem, _ = resumen_validacion_final(tabla_referencias, tabla_validacion)
+
+            analysis_id = memoria.save_analysis(
+                semillas_para_memoria,
+                df_total,
+                score_final_mem,
+                score_auto,
+                lectura_final_mem,
+                color_patron,
+                ideas,
+                notes="Guardado desde Streamlit"
+            )
+
+            st.success(f"Análisis guardado en memoria IA con ID {analysis_id}")
+
+    if ver_memoria:
+        st.markdown("### Últimos análisis guardados")
+        st.dataframe(memoria.recent_analyses(10), use_container_width=True)
+
+        st.markdown("### Patrones ganadores históricos")
+        st.dataframe(memoria.leaderboard(30), use_container_width=True)
