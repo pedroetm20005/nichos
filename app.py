@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 import html
+import hashlib
 import pandas as pd
 import numpy as np
 from urllib.parse import quote
@@ -22,6 +23,58 @@ MAX_SAFE_KEYWORDS = 150
 MAX_SAFE_DEPTH = 2
 MAX_SAFE_BRANCHES = 50
 RATE_LIMIT_SECONDS = 20
+AUTO_SAVE_SEARCHES_TO_MEMORY = True
+
+
+# =========================================================
+# ACCESO PRIVADO
+# ESTO SIRVE PARA QUE SOLO ENTREN PERSONAS CON CODIGO.
+# EN STREAMLIT CLOUD LO IDEAL ES PONER LOS CODIGOS EN SECRETS.
+# =========================================================
+
+ACCESS_CONTROL_ENABLED = True
+
+
+def get_allowed_access_codes():
+    try:
+        codes = st.secrets.get("ACCESS_CODES", [])
+        return [str(code).strip() for code in codes if str(code).strip()]
+    except Exception:
+        return []
+
+
+def require_access_code():
+    if not ACCESS_CONTROL_ENABLED:
+        return
+
+    if st.session_state.get("access_granted"):
+        return
+
+    st.title("Acceso privado")
+    st.caption("Introduce tu codigo de acceso para usar la app.")
+
+    code = st.text_input("Codigo de acceso", type="password")
+    entrar = st.button("Entrar")
+
+    allowed_codes = get_allowed_access_codes()
+
+    if not allowed_codes:
+        st.warning(
+            "No hay codigos configurados. En Streamlit Cloud anade ACCESS_CODES en Secrets."
+        )
+        st.stop()
+
+    if entrar:
+        if code.strip() in allowed_codes:
+            st.session_state.access_granted = True
+            st.rerun()
+        else:
+            st.error("Codigo incorrecto.")
+
+    st.stop()
+
+
+require_access_code()
 
 
 st.set_page_config(
@@ -339,6 +392,55 @@ def format_pattern(pattern_item):
 
 
 memoria = PatternMemory("data/pattern_memory.sqlite")
+
+
+def build_analysis_signature(seeds, df_total):
+    # ESTO SIRVE PARA NO GUARDAR LA MISMA BUSQUEDA 20 VECES CUANDO STREAMLIT RECARGA.
+    urls = []
+    if df_total is not None and not df_total.empty and "URL" in df_total.columns:
+        urls = sorted([str(u) for u in df_total["URL"].dropna().head(50).tolist()])
+
+    raw = json.dumps(
+        {
+            "seeds": seeds,
+            "urls": urls,
+            "total": 0 if df_total is None else int(len(df_total))
+        },
+        sort_keys=True
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def autosave_analysis_once(seeds, df_total, final_score, auto_score, reading, color_rgb, ideas):
+    # ESTO GUARDA CADA BUSQUEDA EN LA MEMORIA IA UNA SOLA VEZ.
+    # NO GUARDA IP, EMAIL, NOMBRE NI DATOS PERSONALES.
+    if not AUTO_SAVE_SEARCHES_TO_MEMORY:
+        return None
+
+    if df_total is None or df_total.empty:
+        return None
+
+    signature = build_analysis_signature(seeds, df_total)
+    saved = st.session_state.get("saved_analysis_signatures", set())
+
+    if signature in saved:
+        return None
+
+    analysis_id = memoria.save_analysis(
+        seeds,
+        df_total,
+        final_score,
+        auto_score,
+        reading,
+        color_rgb,
+        ideas,
+        notes="Guardado automatico sin datos personales"
+    )
+
+    saved.add(signature)
+    st.session_state.saved_analysis_signatures = saved
+    st.session_state.last_saved_analysis_id = analysis_id
+    return analysis_id
 
 
 # =========================================================
@@ -1564,6 +1666,7 @@ max_guiones = st.sidebar.slider("Videos buenos para guion", 1, 10, 5)
 st.sidebar.markdown("### MEMORIA")
 guardar_en_memoria = st.sidebar.checkbox("Guardar analisis en memoria IA", value=False, help="Si la app es publica, activa esto solo si quieres guardar este analisis en la memoria compartida de la app.")
 ver_memoria = st.sidebar.checkbox("Ver memoria aprendida", value=False)
+st.sidebar.caption("Auto-memoria activa: cada busqueda guarda patrones anonimos una vez.")
 
 st.markdown("""
 <div class="top-banner">
@@ -1580,6 +1683,7 @@ input_raw = st.text_input(
 )
 
 st.caption("Privacidad: esta app no pide datos personales. Las busquedas se procesan desde el servidor de la app. Si activas la memoria IA, solo se guardan patrones del analisis, no datos personales.")
+st.caption("Memoria IA: cada busqueda completada guarda automaticamente patrones anonimos para mejorar futuras lecturas del nicho.")
 
 st.markdown(f"""
 <div class="chips">
@@ -1670,6 +1774,26 @@ ideas = generar_ideas_ataque(
 )
 
 color_patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+semillas_para_autoguardado = st.session_state.get(
+    "semillas_iniciales",
+    [k.strip().lower() for k in input_raw.split(",") if k.strip()]
+)
+score_memoria_auto, lectura_memoria_auto, _ = resumen_validacion_final(
+    tabla_referencias,
+    tabla_validacion
+)
+autosaved_id = autosave_analysis_once(
+    semillas_para_autoguardado,
+    df_total,
+    score_memoria_auto,
+    score_auto,
+    lectura_memoria_auto,
+    color_patron,
+    ideas
+)
+
+if autosaved_id:
+    st.success(f"Busqueda guardada automaticamente en memoria IA con ID {autosaved_id}.")
 
 tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_memoria = st.tabs([
     "Videos outliers",
