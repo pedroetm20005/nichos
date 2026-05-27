@@ -17,15 +17,24 @@ from colorthief import ColorThief
 from youtube_transcript_api import YouTubeTranscriptApi
 
 
+PUBLIC_MODE = True
+MAX_SAFE_KEYWORDS = 150
+MAX_SAFE_DEPTH = 2
+MAX_SAFE_BRANCHES = 50
+RATE_LIMIT_SECONDS = 20
+
+
 st.set_page_config(
     page_title="Minero Multinicho Pro v4.0",
-    page_icon="🧠",
+    page_icon="brain",
     layout="wide"
 )
 
 
 # =========================================================
 # MEMORIA IA
+# ESTO SIRVE PARA GUARDAR PATRONES DE NICHOS BUENOS EN SQLITE.
+# LA APP USA ESTO PARA COMPARAR NUEVAS BUSQUEDAS CON LO APRENDIDO.
 # =========================================================
 
 class PatternMemory:
@@ -113,7 +122,7 @@ class PatternMemory:
                 "score": None,
                 "label": "Memoria insuficiente",
                 "confidence": "Baja",
-                "motives": [f"Hay {history_count} análisis guardados. Guarda al menos 3 para empezar a predecir."],
+                "motives": [f"Hay {history_count} analisis guardados. Guarda al menos 3 para empezar a predecir."],
                 "winning_patterns": []
             }
 
@@ -152,7 +161,7 @@ class PatternMemory:
                 "score": 45,
                 "label": "Nicho testeable",
                 "confidence": "Baja",
-                "motives": ["No hay patrones históricos parecidos suficientes."],
+                "motives": ["No hay patrones historicos parecidos suficientes."],
                 "winning_patterns": []
             }
 
@@ -161,13 +170,13 @@ class PatternMemory:
         score = int(max(0, min(100, 35 + impact * 18 + coverage * 20)))
 
         if score >= 75:
-            label = "Alta probabilidad según memoria"
+            label = "Alta probabilidad segun memoria"
         elif score >= 58:
-            label = "Prometedor según memoria"
+            label = "Prometedor segun memoria"
         elif score >= 42:
-            label = "Testeable según memoria"
+            label = "Testeable segun memoria"
         else:
-            label = "Débil según memoria"
+            label = "Debil segun memoria"
 
         confidence = "Alta" if len(matched) >= 8 else "Media" if len(matched) >= 4 else "Baja"
 
@@ -176,8 +185,8 @@ class PatternMemory:
             "label": label,
             "confidence": confidence,
             "motives": [
-                f"Coinciden {len(matched)} patrones con la memoria histórica.",
-                f"Confianza {confidence.lower()} basada en {history_count} análisis guardados."
+                f"Coinciden {len(matched)} patrones con la memoria historica.",
+                f"Confianza {confidence.lower()} basada en {history_count} analisis guardados."
             ],
             "winning_patterns": sorted(matched, key=lambda x: x["impact"], reverse=True)[:8]
         }
@@ -334,6 +343,8 @@ memoria = PatternMemory("data/pattern_memory.sqlite")
 
 # =========================================================
 # ESTILO VISUAL
+# ESTO SIRVE PARA CAMBIAR EL ASPECTO DE LA APP:
+# COLORES, TARJETAS, MINIATURAS, TITULOS Y DISTRIBUCION.
 # =========================================================
 
 def inject_css():
@@ -521,8 +532,8 @@ def render_video_card(row):
             <div class="video-title-fixed">{title}</div>
         </div>
         <div class="meta-fixed">
-            {channel} · {subs} subs<br>
-            {views} views · {published}
+            {channel} - {subs} subs<br>
+            {views} views - {published}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -542,6 +553,8 @@ def render_outlier_cards(df_total):
 
 # =========================================================
 # MINERO YOUTUBE
+# ESTO SIRVE PARA PEDIR SUGERENCIAS, BUSCAR VIDEOS,
+# SACAR VISTAS, CANALES, MINIATURAS, SUBS Y TRANSCRIPCIONES.
 # =========================================================
 
 class YouTubeHyperMiner:
@@ -590,10 +603,10 @@ class YouTubeHyperMiner:
                             v_renderer = item["videoRenderer"]
                             time_text = v_renderer.get("publishedTimeText", {}).get("simpleText", "Unknown")
 
-                            if "year" in time_text.lower() or "año" in time_text.lower():
+                            if "year" in time_text.lower() or "ano" in time_text.lower():
                                 continue
 
-                            title = v_renderer.get("title", {}).get("runs", [{}])[0].get("text", "Sin título")
+                            title = v_renderer.get("title", {}).get("runs", [{}])[0].get("text", "Sin titulo")
                             v_id = v_renderer.get("videoId", "")
 
                             byline_run = v_renderer.get("longBylineText", {}).get("runs", [{}])[0]
@@ -727,6 +740,8 @@ class YouTubeHyperMiner:
 
 # =========================================================
 # FUNCIONES DE ANALISIS
+# ESTO SIRVE PARA EXPANDIR KEYWORDS, FILTRAR OUTLIERS,
+# CALCULAR NOTAS, CREAR IDEAS Y VALIDAR SI UN NICHO ES BUENO.
 # =========================================================
 
 def generar_keywords_red_autocomplete(miner, semillas_iniciales, max_keywords=250, profundidad=3):
@@ -867,13 +882,13 @@ def published_age_days(published):
 
     if "hour" in p or "hora" in p:
         return 0
-    if "day" in p or "dia" in p or "día" in p:
+    if "day" in p or "dia" in p or "dia" in p:
         return n
     if "week" in p or "semana" in p:
         return n * 7
     if "month" in p or "mes" in p:
         return n * 30
-    if "year" in p or "año" in p:
+    if "year" in p or "ano" in p:
         return n * 365
 
     return None
@@ -882,14 +897,14 @@ def published_age_days(published):
 def filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_subs):
     df = df_total.copy()
 
-    if periodo_publicacion == "Últimos 3 meses":
+    if periodo_publicacion == "Ultimos 3 meses":
         df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 90)]
-    elif periodo_publicacion == "Últimos 6 meses":
+    elif periodo_publicacion == "Ultimos 6 meses":
         df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 180)]
     elif periodo_publicacion == "Cualquier reciente":
         df = df[df["Published"].apply(lambda p: (published_age_days(p) or 99999) <= 365)]
 
-    if rango_subs == "Canales pequeños 0 - 100K":
+    if rango_subs == "Canales pequenos 0 - 100K":
         df = df[df["Subscribers"].apply(lambda s: 0 < parse_number_label(s) <= 100000)]
     elif rango_subs == "0 - 500K":
         df = df[df["Subscribers"].apply(lambda s: 0 < parse_number_label(s) <= 500000)]
@@ -951,7 +966,7 @@ def evaluar_destaca(row):
         motivos.append(f"multiplicador fuerte ({multi:.1f}x)")
 
     if subs > 0 and views >= subs:
-        motivos.append("más vistas que subs del canal")
+        motivos.append("mas vistas que subs del canal")
 
     if subs > 0 and views >= subs * 2:
         motivos.append("duplica o supera los subs")
@@ -962,7 +977,7 @@ def evaluar_destaca(row):
     if views >= 100000:
         motivos.append("buen volumen de vistas")
 
-    destaca = "Sí" if motivos else "No"
+    destaca = "Si" if motivos else "No"
     razon = ", ".join(motivos) if motivos else "No destaca con las reglas actuales"
 
     return destaca, razon
@@ -981,8 +996,8 @@ def crear_tabla_referencias(df_total):
             "Vistas": int(row.get("Views", 0)),
             "Subs canal": row.get("Subscribers", "Unknown"),
             "Fecha": row.get("Published", "Unknown"),
-            "¿Destaca?": destaca,
-            "¿Por qué llama la atención?": razon
+            "Destaca?": destaca,
+            "Por que llama la atencion?": razon
         })
 
     return pd.DataFrame(filas)
@@ -1010,7 +1025,7 @@ def crear_tabla_validacion(df_total):
             if 0 < subs <= 100000:
                 canal_pequeno = True
 
-            if destaca == "Sí":
+            if destaca == "Si":
                 destacados += 1
 
         if hay_3 and canal_pequeno and destacados >= 2:
@@ -1025,8 +1040,8 @@ def crear_tabla_validacion(df_total):
             "Video ref. 1": refs[0],
             "Video ref. 2": refs[1],
             "Video ref. 3": refs[2],
-            "¿Hay 3 videos ref.?": "Sí" if hay_3 else "No",
-            "¿Alguno es de un canal pequeño?": canal_pequeno,
+            "Hay 3 videos ref.?": "Si" if hay_3 else "No",
+            "Alguno es de un canal pequeno?": canal_pequeno,
             "Prioridad": prioridad
         })
 
@@ -1047,11 +1062,11 @@ def resumen_validacion_final(tabla_referencias, tabla_validacion):
     refs_recientes = 0
 
     for _, row in tabla_referencias.iterrows():
-        destaca = str(row.get("¿Destaca?", "")).lower()
+        destaca = str(row.get("Destaca?", "")).lower()
         subs = parse_number_label(row.get("Subs canal", ""))
         fecha = row.get("Fecha", "")
 
-        if "sí" in destaca or "si" in destaca:
+        if "si" in destaca or "si" in destaca:
             destacados += 1
 
         if subs == 0:
@@ -1065,24 +1080,24 @@ def resumen_validacion_final(tabla_referencias, tabla_validacion):
 
     if total_refs >= 3:
         score += 10
-        motivos.append("Hay suficientes vídeos de referencia para comparar.")
+        motivos.append("Hay suficientes videos de referencia para comparar.")
 
     if destacados >= 5:
         score += 25
-        motivos.append(f"Hay {destacados} vídeos marcados como destacados.")
+        motivos.append(f"Hay {destacados} videos marcados como destacados.")
     elif destacados >= 3:
         score += 18
-        motivos.append(f"Hay {destacados} vídeos destacados.")
+        motivos.append(f"Hay {destacados} videos destacados.")
     elif destacados >= 1:
         score += 8
-        motivos.append("Hay al menos un vídeo destacado.")
+        motivos.append("Hay al menos un video destacado.")
 
     if canales_pequenos_refs >= 2:
         score += 25
-        motivos.append(f"Hay {canales_pequenos_refs} canales pequeños con señales fuertes.")
+        motivos.append(f"Hay {canales_pequenos_refs} canales pequenos con senales fuertes.")
     elif canales_pequenos_refs >= 1:
         score += 15
-        motivos.append("Hay al menos un canal pequeño validando la oportunidad.")
+        motivos.append("Hay al menos un canal pequeno validando la oportunidad.")
 
     if refs_recientes >= 3:
         score += 15
@@ -1108,13 +1123,13 @@ def resumen_validacion_final(tabla_referencias, tabla_validacion):
     score = min(score, 100)
 
     if score >= 75:
-        lectura = "🔥 Nicho rentable / Alta prioridad"
+        lectura = "FUEGO Nicho rentable / Alta prioridad"
     elif score >= 55:
-        lectura = "📈 Nicho prometedor"
+        lectura = "PROMETEDOR Nicho prometedor"
     elif score >= 35:
-        lectura = "🧪 Nicho testeable"
+        lectura = "TEST Nicho testeable"
     else:
-        lectura = "🧊 Señal débil"
+        lectura = "FRIO Senal debil"
 
     return score, lectura, motivos
 
@@ -1212,19 +1227,19 @@ def generar_direccion_miniatura(df_total, color_rgb):
         instrucciones.append("Base visual media: conviene exagerar contraste con sombras y contornos.")
 
     if r > g and r > b:
-        instrucciones.append("El nicho tira a tonos cálidos: rojo/naranja puede funcionar para peligro, emoción o urgencia.")
+        instrucciones.append("El nicho tira a tonos calidos: rojo/naranja puede funcionar para peligro, emocion o urgencia.")
     elif b > r and b > g:
-        instrucciones.append("El nicho tira a tonos fríos: azul/cian puede funcionar para misterio, tecnología o fantasía.")
+        instrucciones.append("El nicho tira a tonos frios: azul/cian puede funcionar para misterio, tecnologia o fantasia.")
     elif g > r and g > b:
-        instrucciones.append("El nicho tira a tonos verdes: úsalo para naturaleza, juego, crecimiento, rareza o toxicidad.")
+        instrucciones.append("El nicho tira a tonos verdes: usalo para naturaleza, juego, crecimiento, rareza o toxicidad.")
     else:
-        instrucciones.append("Color dominante neutro: apóyate más en caras, flechas, círculos y contraste.")
+        instrucciones.append("Color dominante neutro: apoyate mas en caras, flechas, circulos y contraste.")
 
     if top:
         instrucciones.append(f"Elementos a probar en miniatura: {', '.join(top)}.")
 
     instrucciones.append("Texto recomendado: 2 a 4 palabras, grande, sin frases largas.")
-    instrucciones.append("Promesa visual: antes/después, secreto, peligro, reto extremo o comparación clara.")
+    instrucciones.append("Promesa visual: antes/despues, secreto, peligro, reto extremo o comparacion clara.")
 
     return instrucciones
 
@@ -1248,7 +1263,7 @@ def calcular_score_oportunidad(df_total):
         motivos.append(f"Hay un video potente con {max_multi:.1f}x sobre la mediana.")
     elif max_multi >= 2:
         score += 12
-        motivos.append(f"Hay señales moderadas de outlier con {max_multi:.1f}x.")
+        motivos.append(f"Hay senales moderadas de outlier con {max_multi:.1f}x.")
 
     if outliers_3x >= 3:
         score += 20
@@ -1263,7 +1278,7 @@ def calcular_score_oportunidad(df_total):
         motivos.append("Varios outliers son recientes.")
     elif recencia >= 60:
         score += 12
-        motivos.append("Hay algunas señales recientes.")
+        motivos.append("Hay algunas senales recientes.")
 
     views_medias = df_total["Views"].head(10).mean()
     if views_medias >= 500000:
@@ -1447,7 +1462,7 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
 
     status_box = st.empty()
     progress_bar = st.progress(0)
-    status_box.info("🧬 Expandiendo keywords en red con autocomplete de YouTube...")
+    status_box.info(" Expandiendo keywords en red con autocomplete de YouTube...")
 
     cola_keywords = generar_keywords_red_autocomplete(
         miner,
@@ -1471,7 +1486,7 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
         ciclo_actual += 1
         progress_bar.progress(ciclo_actual / max_ciclos)
 
-        status_box.info(f"🔮 Excavando en rama [{ciclo_actual}/{total_ramas_encontradas}]: **{kw_actual}**")
+        status_box.info(f" Excavando en rama [{ciclo_actual}/{total_ramas_encontradas}]: **{kw_actual}**")
         videos = miner.scrape_keyword_videos(kw_actual)
 
         if videos:
@@ -1502,7 +1517,7 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
         top_videos = df_ordenado.head(max_guiones).to_dict(orient="records")
 
         for index, row in enumerate(top_videos):
-            status_box.text(f"📖 [{index + 1}/{len(top_videos)}] Extrayendo guion de: {row['Title'][:60]}...")
+            status_box.text(f" [{index + 1}/{len(top_videos)}] Extrayendo guion de: {row['Title'][:60]}...")
             texto_guion = miner.extract_script_keywords(row["ID"])
 
             if texto_guion:
@@ -1518,7 +1533,7 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
 
     nichos_similares = generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acumulados, limite=40)
 
-    status_box.success("🎉 ¡Mapeo completado con éxito!")
+    status_box.success(" Mapeo completado con exito!")
     st.session_state.outliers_data = historico_outliers
     st.session_state.guiones_data = guiones_acumulados
     st.session_state.nichos_similares = nichos_similares
@@ -1526,6 +1541,8 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
 
 # =========================================================
 # APP
+# ESTO ES LA INTERFAZ: SIDEBAR, BUSCADOR, BOTONES,
+# PESTANAS, TABLAS, TARJETAS DE VIDEOS Y RESULTADOS.
 # =========================================================
 
 inject_css()
@@ -1534,18 +1551,18 @@ st.sidebar.markdown("## Minero Pro")
 st.sidebar.caption("Filtros del radar")
 
 st.sidebar.markdown("### OUTLIERS")
-outlier_factor = st.sidebar.slider("Outlier score mínimo", 1.1, 5.0, 1.2, step=0.1)
-periodo_publicacion = st.sidebar.selectbox("Publication date", ["Últimos 3 meses", "Últimos 6 meses", "Cualquier reciente"])
-rango_subs = st.sidebar.selectbox("Subscribers", ["Canales pequeños 0 - 100K", "0 - 500K", "Cualquiera"])
+outlier_factor = st.sidebar.slider("Outlier score minimo", 1.1, 5.0, 1.2, step=0.1)
+periodo_publicacion = st.sidebar.selectbox("Publication date", ["Ultimos 3 meses", "Ultimos 6 meses", "Cualquier reciente"])
+rango_subs = st.sidebar.selectbox("Subscribers", ["Canales pequenos 0 - 100K", "0 - 500K", "Cualquiera"])
 
 st.sidebar.markdown("### RAMAS / RED")
-max_ciclos = st.sidebar.slider("Ramas totales", 2, 120, 50)
-max_keywords_expansion = st.sidebar.slider("Keywords reales máximas", 50, 500, 250)
-profundidad_keywords = st.sidebar.slider("Profundidad de red", 1, 4, 3)
+max_ciclos = st.sidebar.slider("Ramas totales", 2, MAX_SAFE_BRANCHES, 40)
+max_keywords_expansion = st.sidebar.slider("Keywords reales maximas", 50, MAX_SAFE_KEYWORDS, 120)
+profundidad_keywords = st.sidebar.slider("Profundidad de red", 1, MAX_SAFE_DEPTH, 2)
 max_guiones = st.sidebar.slider("Videos buenos para guion", 1, 10, 5)
 
 st.sidebar.markdown("### MEMORIA")
-guardar_en_memoria = st.sidebar.checkbox("Guardar análisis en memoria IA", value=True)
+guardar_en_memoria = st.sidebar.checkbox("Guardar analisis en memoria IA", value=False, help="Si la app es publica, activa esto solo si quieres guardar este analisis en la memoria compartida de la app.")
 ver_memoria = st.sidebar.checkbox("Ver memoria aprendida", value=False)
 
 st.markdown("""
@@ -1561,6 +1578,8 @@ input_raw = st.text_input(
     value=nicho_default,
     placeholder="Escribe el nicho: how to train your dragon, roblox horror, shorts ai..."
 )
+
+st.caption("Privacidad: esta app no pide datos personales. Las busquedas se procesan desde el servidor de la app. Si activas la memoria IA, solo se guardan patrones del analisis, no datos personales.")
 
 st.markdown(f"""
 <div class="chips">
@@ -1581,23 +1600,43 @@ with col_random:
     random_click = st.button("Random", use_container_width=True)
 
 with col_saved:
-    st.caption(f"Filtros activos: {periodo_publicacion} · {rango_subs}")
+    st.caption(f"Filtros activos: {periodo_publicacion} - {rango_subs}")
 
 if random_click:
     input_raw = "viral ai shorts, roblox horror, minecraft survival, dragon theory"
     st.session_state.nicho_buscado = input_raw
 
+def check_rate_limit(seconds=RATE_LIMIT_SECONDS):
+    now = time.time()
+    last_run = st.session_state.get("last_run_ts", 0)
+
+    if now - last_run < seconds:
+        wait = int(seconds - (now - last_run))
+        st.warning(f"Espera {wait}s antes de lanzar otra busqueda.")
+        return False
+
+    st.session_state.last_run_ts = now
+    return True
+
 if buscar or random_click:
-    st.session_state.nicho_buscado = input_raw
-    run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords)
+    if check_rate_limit():
+        st.session_state.nicho_buscado = input_raw
+        run_mining(
+            input_raw,
+            outlier_factor,
+            max_ciclos,
+            max_guiones,
+            max_keywords_expansion,
+            profundidad_keywords
+        )
 
 if "keywords_generadas" in st.session_state and st.session_state.keywords_generadas:
-    with st.expander("🧬 Keywords generadas por la expansión en red", expanded=False):
+    with st.expander(" Keywords generadas por la expansion en red", expanded=False):
         st.write(f"Total generadas: {len(st.session_state.keywords_generadas)}")
         st.text_area("Keywords encontradas:", value=", ".join(st.session_state.keywords_generadas), height=180)
 
 if not st.session_state.get("outliers_data"):
-    st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho. Los videos que salgan aquí serán outliers.")
+    st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho. Los videos que salgan aqui seran outliers.")
     st.stop()
 
 df_total = pd.DataFrame(st.session_state.outliers_data)
@@ -1614,7 +1653,7 @@ df_total = filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_sub
 if df_total.empty:
     st.warning(
         f"Hay {len(df_total_sin_filtros)} outliers encontrados, pero ninguno pasa los filtros actuales: "
-        f"{periodo_publicacion} · {rango_subs}. Abre el filtro de meses/subs para verlos."
+        f"{periodo_publicacion} - {rango_subs}. Abre el filtro de meses/subs para verlos."
     )
     st.stop()
 
@@ -1662,7 +1701,7 @@ with tab_outliers:
         )
 
 with tab_nicho:
-    st.markdown("## Validación del nicho")
+    st.markdown("## Validacion del nicho")
     st.warning("Si ves Subs canal como Hidden/Unknown, puedes escribirlos a mano. Ejemplo: 25K, 80K, 1.2M.")
 
     st.markdown("### Tabla de ideas de los canales referencia")
@@ -1672,24 +1711,24 @@ with tab_nicho:
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "¿Destaca?": st.column_config.SelectboxColumn("¿Destaca?", options=["Sí", "No"], required=True),
+            "Destaca?": st.column_config.SelectboxColumn("Destaca?", options=["Si", "No"], required=True),
             "Link": st.column_config.LinkColumn("Link"),
             "Subs canal": st.column_config.TextColumn("Subs canal"),
-            "¿Por qué llama la atención?": st.column_config.TextColumn("¿Por qué llama la atención?")
+            "Por que llama la atencion?": st.column_config.TextColumn("Por que llama la atencion?")
         },
         key="tabla_referencias_editor"
     )
 
-    st.markdown("### Tabla de validación de ideas")
+    st.markdown("### Tabla de validacion de ideas")
 
     tabla_validacion_editada = st.data_editor(
         tabla_validacion,
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "¿Hay 3 videos ref.?": st.column_config.SelectboxColumn("¿Hay 3 videos ref.?", options=["Sí", "No"], required=True),
+            "Hay 3 videos ref.?": st.column_config.SelectboxColumn("Hay 3 videos ref.?", options=["Si", "No"], required=True),
             "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["Alta", "Media", "Baja"], required=True),
-            "¿Alguno es de un canal pequeño?": st.column_config.CheckboxColumn("¿Alguno es de un canal pequeño?")
+            "Alguno es de un canal pequeno?": st.column_config.CheckboxColumn("Alguno es de un canal pequeno?")
         },
         key="tabla_validacion_editor"
     )
@@ -1702,22 +1741,22 @@ with tab_nicho:
     col_score1, col_score2, col_score3 = st.columns(3)
     col_score1.metric("Nota final del nicho", f"{score_final}/100")
     col_score2.metric("Resultado", lectura_final)
-    col_score3.metric("Score automático bruto", f"{score_auto}/100")
+    col_score3.metric("Score automatico bruto", f"{score_auto}/100")
 
     st.markdown("**Motivos de la nota final:**")
     for m in motivos_finales:
         st.write(f"- {m}")
 
     if motivos_auto:
-        st.markdown("**Señales automáticas extra:**")
+        st.markdown("**Senales automaticas extra:**")
         for m in motivos_auto:
             st.write(f"- {m}")
 
-    st.markdown("### 🧭 Nichos similares para seguir excavando")
+    st.markdown("###  Nichos similares para seguir excavando")
 
     if "nichos_similares" in st.session_state and st.session_state.nichos_similares:
         st.text_area(
-            "Copia estos nichos/ramas para una nueva búsqueda:",
+            "Copia estos nichos/ramas para una nueva busqueda:",
             value=", ".join(st.session_state.nichos_similares),
             height=130
         )
@@ -1727,19 +1766,19 @@ with tab_nicho:
             with cols_nichos[i % 3]:
                 st.code(nicho)
     else:
-        st.info("Aún no hay suficientes señales para sugerir nichos similares.")
+        st.info("Aun no hay suficientes senales para sugerir nichos similares.")
 
-    st.markdown("### 🖼️ Dirección de miniatura")
+    st.markdown("### ")
     st.write(f"Color dominante detectado: RGB {color_patron}")
 
     for instruccion in generar_direccion_miniatura(df_total, color_patron):
         st.write(f"- {instruccion}")
 
-    st.markdown("### 🎨 Generador de base de miniatura basado en datos")
+    st.markdown("### ")
 
     if st.button("Analizar miniaturas ganadoras y generar base"):
         patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
-        st.write(f"Patrón de color detectado: {patron}")
+        st.write(f"Patron de color detectado: {patron}")
         base_img = crear_base_miniatura(patron)
         st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
 
@@ -1748,13 +1787,13 @@ with tab_ideas:
 
     st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=260)
 
-    st.markdown("## 🧠 Cajas de extracción rápida")
+    st.markdown("## brain Cajas de extraccion rapida")
 
     c1, c2 = st.columns(2)
     semilla_referencia = df_total["Keyword_Origen"].iloc[0] if not df_total.empty else "video"
 
     with c1:
-        st.markdown("### 🔗 Basado en títulos ganadores")
+        st.markdown("### ")
 
         titulos_buenos = df_total["Title"].tolist()
         stopwords_titulos = {
@@ -1774,21 +1813,21 @@ with tab_ideas:
         top_bi = Counter(bigramas).most_common(8)
         sug_titulos_caja = [f"{semilla_referencia} {token}" for token, _ in top_bi]
 
-        st.text_area("📋 Patrones de títulos:", value=", ".join(list(dict.fromkeys(sug_titulos_caja))), height=100)
+        st.text_area("", value=", ".join(list(dict.fromkeys(sug_titulos_caja))), height=100)
 
     with c2:
-        st.markdown("### 📖 Basado en lo hablado en guiones")
+        st.markdown("### Basado en lo hablado en guiones")
 
         if "guiones_data" in st.session_state and st.session_state.guiones_data:
             texto_global = " ".join([g["Texto"] for g in st.session_state.guiones_data])
             conceptos_guion = extraer_conceptos_de_texto(texto_global, limite=10)
             sug_guion_caja = [f"{semilla_referencia} {palabra}" for palabra, _ in conceptos_guion]
 
-            st.text_area("📋 Palabras clave del guion:", value=", ".join(list(dict.fromkeys(sug_guion_caja))), height=100)
+            st.text_area("", value=", ".join(list(dict.fromkeys(sug_guion_caja))), height=100)
         else:
-            st.info("No hay suficientes transcripciones procesadas aún en esta tanda.")
+            st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
 
-    st.markdown("## 📖 Radar de transcripciones")
+    st.markdown("##  Radar de transcripciones")
 
     if "guiones_data" in st.session_state and st.session_state.guiones_data:
         for i, guion in enumerate(st.session_state.guiones_data, start=1):
@@ -1807,14 +1846,14 @@ with tab_ideas:
                     nuevas_busquedas = [f"{keyword_base_guion} {palabra}" for palabra, _ in conceptos[:8]]
 
                     st.text_area(
-                        "Nuevas búsquedas sugeridas desde esta transcripción:",
+                        "Nuevas busquedas sugeridas desde esta transcripcion:",
                         value=", ".join(nuevas_busquedas),
                         height=80,
                         key=f"ideas_guion_{i}"
                     )
 
                 st.text_area(
-                    "Fragmento de transcripción:",
+                    "Fragmento de transcripcion:",
                     value=guion["Texto"][:2500],
                     height=180,
                     key=f"preview_guion_{i}"
@@ -1826,7 +1865,7 @@ with tab_canales:
     st.markdown("## Canales validados")
 
     if tabla_canales.empty:
-        st.info("Aún no hay canales validados.")
+        st.info("Aun no hay canales validados.")
     else:
         st.dataframe(
             tabla_canales,
@@ -1862,13 +1901,13 @@ with tab_memoria:
             st.write(f"- {motivo}")
 
         if prediccion_memoria["winning_patterns"]:
-            st.markdown("**Patrones históricos que empujan a favor:**")
+            st.markdown("**Patrones historicos que empujan a favor:**")
 
             for p in prediccion_memoria["winning_patterns"]:
                 st.write(f'- {format_pattern(p)} | peso {p["avg_weight"]:.2f} | usos {p["uses"]}')
 
     if guardar_en_memoria:
-        if st.button("💾 Guardar resultado en memoria IA"):
+        if st.button(" Guardar resultado en memoria IA"):
             score_final_mem, lectura_final_mem, _ = resumen_validacion_final(tabla_referencias, tabla_validacion)
 
             analysis_id = memoria.save_analysis(
@@ -1882,11 +1921,13 @@ with tab_memoria:
                 notes="Guardado desde Streamlit"
             )
 
-            st.success(f"Análisis guardado en memoria IA con ID {analysis_id}")
+            st.success(f"Analisis guardado en memoria IA con ID {analysis_id}")
 
     if ver_memoria:
-        st.markdown("### Últimos análisis guardados")
+        st.markdown("### Ultimos analisis guardados")
         st.dataframe(memoria.recent_analyses(10), use_container_width=True)
 
-        st.markdown("### Patrones ganadores históricos")
+        st.markdown("### Patrones ganadores historicos")
         st.dataframe(memoria.leaderboard(30), use_container_width=True)
+
+
