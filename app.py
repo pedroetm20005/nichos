@@ -1937,7 +1937,12 @@ with tab_ideas:
         top_bi = Counter(bigramas).most_common(8)
         sug_titulos_caja = [f"{semilla_referencia} {token}" for token, _ in top_bi]
 
-        st.text_area("", value=", ".join(list(dict.fromkeys(sug_titulos_caja))), height=100)
+        st.text_area(
+            "Patrones de titulos",
+            value=", ".join(list(dict.fromkeys(sug_titulos_caja))),
+            height=100,
+            label_visibility="collapsed"
+        )
 
     with c2:
         st.markdown("### Basado en lo hablado en guiones")
@@ -1947,7 +1952,12 @@ with tab_ideas:
             conceptos_guion = extraer_conceptos_de_texto(texto_global, limite=10)
             sug_guion_caja = [f"{semilla_referencia} {palabra}" for palabra, _ in conceptos_guion]
 
-            st.text_area("", value=", ".join(list(dict.fromkeys(sug_guion_caja))), height=100)
+            st.text_area(
+                "Palabras clave del guion",
+                value=", ".join(list(dict.fromkeys(sug_guion_caja))),
+                height=100,
+                label_visibility="collapsed"
+            )
         else:
             st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
 
