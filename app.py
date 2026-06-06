@@ -2,7 +2,8 @@ import streamlit as st
 import requests
 import json
 import re
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import time
 import html
 import hashlib
@@ -86,53 +87,81 @@ require_access_code()
 
 # =========================================================
 # MEMORIA IA
-# ESTO SIRVE PARA GUARDAR PATRONES DE NICHOS BUENOS EN SQLITE.
+# ESTO SIRVE PARA GUARDAR PATRONES DE NICHOS BUENOS EN POSTGRESQL.
 # LA APP USA ESTO PARA COMPARAR NUEVAS BUSQUEDAS CON LO APRENDIDO.
 # =========================================================
 
 class PatternMemory:
-    def __init__(self, db_path="data/pattern_memory.sqlite"):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self):
         self.setup()
 
+    def get_conn(self):
+        import psycopg2
+        import streamlit as st
+        creds = st.secrets["postgres"]
+        return psycopg2.connect(
+            host=creds["host"],
+            database=creds["database"],
+            user=creds["user"],
+            password=creds["password"],
+            port=creds.get("port", 5432)
+        )
+
+    def _execute(self, query, params=None, fetch=None):
+        conn = self.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    if fetch == "one":
+                        return cur.fetchone()
+                    elif fetch == "all":
+                        return cur.fetchall()
+        finally:
+            conn.close()
+
     def setup(self):
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT,
-                seeds TEXT,
-                final_score REAL,
-                auto_score REAL,
-                reading TEXT,
-                color_rgb TEXT,
-                total_videos INTEGER,
-                notes TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS pattern_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                analysis_id INTEGER,
-                pattern_type TEXT,
-                pattern_value TEXT,
-                weight REAL,
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS graph_edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                analysis_id INTEGER,
-                source_type TEXT,
-                source_value TEXT,
-                target_type TEXT,
-                target_value TEXT,
-                weight REAL,
-                created_at TEXT
-            );
-        """)
-        self.conn.commit()
+        conn = self.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS analyses (
+                            id SERIAL PRIMARY KEY,
+                            created_at TEXT,
+                            seeds TEXT,
+                            final_score DOUBLE PRECISION,
+                            auto_score DOUBLE PRECISION,
+                            reading TEXT,
+                            color_rgb TEXT,
+                            total_videos INTEGER,
+                            notes TEXT
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS pattern_events (
+                            id SERIAL PRIMARY KEY,
+                            analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
+                            pattern_type TEXT,
+                            pattern_value TEXT,
+                            weight DOUBLE PRECISION,
+                            created_at TEXT
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS graph_edges (
+                            id SERIAL PRIMARY KEY,
+                            analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
+                            source_type TEXT,
+                            source_value TEXT,
+                            target_type TEXT,
+                            target_value TEXT,
+                            weight DOUBLE PRECISION,
+                            created_at TEXT
+                        );
+                    """)
+        finally:
+            conn.close()
 
     def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
         if df_total is None or df_total.empty:
@@ -141,51 +170,54 @@ class PatternMemory:
         now = datetime.utcnow().isoformat(timespec="seconds")
         seeds_text = ", ".join(seeds) if isinstance(seeds, list) else str(seeds)
 
-        cur = self.conn.execute("""
-            INSERT INTO analyses
-            (created_at, seeds, final_score, auto_score, reading, color_rgb, total_videos, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            now,
-            seeds_text,
-            float(final_score),
-            float(auto_score),
-            str(reading),
-            json.dumps(tuple(int(x) for x in color_rgb)),
-            int(len(df_total)),
-            notes
-        ))
+        conn = self.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO analyses
+                        (created_at, seeds, final_score, auto_score, reading, color_rgb, total_videos, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                    """, (
+                        now,
+                        seeds_text,
+                        float(final_score),
+                        float(auto_score),
+                        str(reading),
+                        json.dumps(tuple(int(x) for x in color_rgb)),
+                        int(len(df_total)),
+                        notes
+                    ))
+                    analysis_id = cur.fetchone()[0]
+                    graph_patterns = Counter()
 
-        analysis_id = cur.lastrowid
-        graph_patterns = Counter()
+                    for _, row_video in df_total.iterrows():
+                        weight = self.video_weight(row_video)
+                        for pattern_type, pattern_value in self.extract_video_patterns(row_video):
+                            cur.execute("""
+                                INSERT INTO pattern_events
+                                (analysis_id, pattern_type, pattern_value, weight, created_at)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (analysis_id, pattern_type, pattern_value, weight, now))
+                            graph_patterns[(pattern_type, pattern_value)] += weight
 
-        for _, row in df_total.iterrows():
-            weight = self.video_weight(row)
-            for pattern_type, pattern_value in self.extract_video_patterns(row):
-                self.conn.execute("""
-                    INSERT INTO pattern_events
-                    (analysis_id, pattern_type, pattern_value, weight, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (analysis_id, pattern_type, pattern_value, weight, now))
-                graph_patterns[(pattern_type, pattern_value)] += weight
+                    for idea in ideas or []:
+                        for pattern_type, pattern_value in self.extract_title_patterns(str(idea)):
+                            cur.execute("""
+                                INSERT INTO pattern_events
+                                (analysis_id, pattern_type, pattern_value, weight, created_at)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (analysis_id, "idea_" + pattern_type, pattern_value, final_score / 100, now))
+                            graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
 
-        for idea in ideas or []:
-            for pattern_type, pattern_value in self.extract_title_patterns(str(idea)):
-                self.conn.execute("""
-                    INSERT INTO pattern_events
-                    (analysis_id, pattern_type, pattern_value, weight, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (analysis_id, "idea_" + pattern_type, pattern_value, final_score / 100, now))
-                graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
+                    self._save_graph_edges_with_cursor(cur, analysis_id, graph_patterns, now)
 
-        self.save_graph_edges(analysis_id, graph_patterns, now)
+            return analysis_id
+        finally:
+            conn.close()
 
-        self.conn.commit()
-        return analysis_id
-
-    def save_graph_edges(self, analysis_id, graph_patterns, created_at):
-        # ESTO CREA CONEXIONES ENTRE PATRONES QUE APARECEN JUNTOS EN UNA BUSQUEDA.
-        # EJEMPLO: "secret" + "dragon" + "canal pequeno" + "outlier alto".
+    def _save_graph_edges_with_cursor(self, cur, analysis_id, graph_patterns, created_at):
         if not graph_patterns:
             return
 
@@ -202,10 +234,10 @@ class PatternMemory:
 
                 edge_weight = float(min(source_weight, target_weight))
 
-                self.conn.execute("""
+                cur.execute("""
                     INSERT INTO graph_edges
                     (analysis_id, source_type, source_value, target_type, target_value, weight, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (
                     analysis_id,
                     source_type,
@@ -217,7 +249,14 @@ class PatternMemory:
                 ))
 
     def predict_opportunity(self, seeds, df_total, color_rgb=None, ideas=None):
-        history_count = self.conn.execute("SELECT COUNT(*) AS total FROM analyses").fetchone()["total"]
+        conn = self.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS total FROM analyses")
+                    history_count = cur.fetchone()[0]
+        finally:
+            conn.close()
 
         if history_count < 3:
             return {
@@ -294,40 +333,51 @@ class PatternMemory:
         }
 
     def leaderboard(self, limit=30):
-        return pd.read_sql_query("""
-            SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
-            FROM pattern_events
-            GROUP BY pattern_type, pattern_value
-            HAVING uses >= 2
-            ORDER BY avg_weight DESC, uses DESC
-            LIMIT ?
-        """, self.conn, params=(limit,))
+        conn = self.get_conn()
+        try:
+            return pd.read_sql_query("""
+                SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+                FROM pattern_events
+                GROUP BY pattern_type, pattern_value
+                HAVING COUNT(*) >= 2
+                ORDER BY avg_weight DESC, uses DESC
+                LIMIT %s
+            """, conn, params=(limit,))
+        finally:
+            conn.close()
 
     def recent_analyses(self, limit=10):
-        return pd.read_sql_query("""
-            SELECT created_at, seeds, final_score, auto_score, reading, total_videos
-            FROM analyses
-            ORDER BY id DESC
-            LIMIT ?
-        """, self.conn, params=(limit,))
+        conn = self.get_conn()
+        try:
+            return pd.read_sql_query("""
+                SELECT created_at, seeds, final_score, auto_score, reading, total_videos
+                FROM analyses
+                ORDER BY id DESC
+                LIMIT %s
+            """, conn, params=(limit,))
+        finally:
+            conn.close()
 
     def graph_data(self, limit_edges=220, min_edge_weight=0.08):
-        # ESTO DEVUELVE LAS CONEXIONES DE MEMORIA PARA PINTAR EL MAPA NEURAL.
-        edges = pd.read_sql_query("""
-            SELECT
-                source_type,
-                source_value,
-                target_type,
-                target_value,
-                COUNT(*) AS uses,
-                SUM(weight) AS total_weight,
-                AVG(weight) AS avg_weight
-            FROM graph_edges
-            GROUP BY source_type, source_value, target_type, target_value
-            HAVING total_weight >= ?
-            ORDER BY total_weight DESC, uses DESC
-            LIMIT ?
-        """, self.conn, params=(min_edge_weight, limit_edges))
+        conn = self.get_conn()
+        try:
+            edges = pd.read_sql_query("""
+                SELECT
+                    source_type,
+                    source_value,
+                    target_type,
+                    target_value,
+                    COUNT(*) AS uses,
+                    SUM(weight) AS total_weight,
+                    AVG(weight) AS avg_weight
+                FROM graph_edges
+                GROUP BY source_type, source_value, target_type, target_value
+                HAVING SUM(weight) >= %s
+                ORDER BY total_weight DESC, uses DESC
+                LIMIT %s
+            """, conn, params=(min_edge_weight, limit_edges))
+        finally:
+            conn.close()
 
         if edges.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -402,17 +452,24 @@ class PatternMemory:
         return patterns
 
     def pattern_stats(self):
-        rows = self.conn.execute("""
-            SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
-            FROM pattern_events
-            GROUP BY pattern_type, pattern_value
-        """).fetchall()
+        conn = self.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+                        FROM pattern_events
+                        GROUP BY pattern_type, pattern_value
+                    """)
+                    rows = cur.fetchall()
+        finally:
+            conn.close()
 
         stats = {}
         for row in rows:
-            stats[(row["pattern_type"], row["pattern_value"])] = {
-                "uses": int(row["uses"]),
-                "avg_weight": float(row["avg_weight"])
+            stats[(row[0], row[1])] = {
+                "uses": int(row[2]),
+                "avg_weight": float(row[3])
             }
 
         return stats
@@ -481,7 +538,7 @@ def format_pattern(pattern_item):
     return f"{pattern_type}: {pattern_value}"
 
 
-memoria = PatternMemory("data/pattern_memory.sqlite")
+memoria = PatternMemory()
 
 
 def neural_node_color(node_type):
