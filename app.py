@@ -249,8 +249,16 @@ def load_global_cache_if_needed():
     if GLOBAL_CACHE_LOADED:
         return
     try:
-        mem = PatternMemory()
-        conn = mem.get_conn()
+        import psycopg2
+        import streamlit as st
+        creds = st.secrets["postgres"]
+        conn = psycopg2.connect(
+            host=creds["host"],
+            database=creds["database"],
+            user=creds["user"],
+            password=creds["password"],
+            port=creds.get("port", 5432)
+        )
         try:
             with conn:
                 with conn.cursor() as cur:
