@@ -239,6 +239,42 @@ def get_cached_graph_edges(limit_edges, min_edge_weight):
         conn.close()
 
 
+GLOBAL_MEMORY_CACHE = {}
+GLOBAL_CACHE_LOADED = False
+
+
+def load_global_cache_if_needed():
+    global GLOBAL_CACHE_LOADED, GLOBAL_MEMORY_CACHE
+    if GLOBAL_CACHE_LOADED:
+        return
+    try:
+        import psycopg2
+        import streamlit as st
+        creds = st.secrets["postgres"]
+        conn = psycopg2.connect(
+            host=creds["host"],
+            database=creds["database"],
+            user=creds["user"],
+            password=creds["password"],
+            port=creds.get("port", 5432)
+        )
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT cache_key, payload, created_at FROM request_cache")
+                    rows = cur.fetchall()
+                    for row in rows:
+                        try:
+                            GLOBAL_MEMORY_CACHE[row[0]] = (json.loads(row[1]), float(row[2] or 0))
+                        except Exception:
+                            pass
+        finally:
+            conn.close()
+        GLOBAL_CACHE_LOADED = True
+    except Exception:
+        pass
+
+
 class PatternMemory:
     def __init__(self):
         _initialize_postgresql_database()
