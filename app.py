@@ -570,11 +570,6 @@ class PatternMemory:
 
     def pattern_stats(self):
         return get_cached_pattern_stats()
-                "uses": int(row[2]),
-                "avg_weight": float(row[3])
-            }
-
-        return stats
 
     def video_weight(self, row):
         multiplier = float(row.get("Multiplicador", 0) or 0)
