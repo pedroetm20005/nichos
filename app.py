@@ -148,6 +148,22 @@ def _initialize_postgresql_database():
                         created_at DOUBLE PRECISION
                     );
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS saved_videos (
+                        id SERIAL PRIMARY KEY,
+                        analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
+                        title TEXT,
+                        channel TEXT,
+                        subscribers TEXT,
+                        views INTEGER,
+                        published TEXT,
+                        url TEXT,
+                        thumbnail TEXT,
+                        multiplier DOUBLE PRECISION,
+                        keyword_origen TEXT,
+                        created_at TEXT
+                    );
+                """)
     finally:
         conn.close()
     return True
@@ -235,6 +251,26 @@ def get_cached_graph_edges(limit_edges, min_edge_weight):
             JOIN analyses a ON g.analysis_id = a.id
             ORDER BY g.id DESC
         """, conn)
+    finally:
+        conn.close()
+
+
+@st.cache_data
+def get_cached_saved_videos(limit_analyses=50):
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        return pd.read_sql_query("""
+            SELECT title AS "Title", channel AS "Channel", subscribers AS "Subscribers", 
+                   views AS "Views", published AS "Published", url AS "URL", 
+                   thumbnail AS "Thumbnail", multiplier AS "Multiplicador", 
+                   keyword_origen AS "Keyword_Origen"
+            FROM saved_videos
+            ORDER BY id DESC
+            LIMIT %s
+        """, conn, params=(limit_analyses * 15,))
+    except Exception:
+        return pd.DataFrame()
     finally:
         conn.close()
 
@@ -438,6 +474,35 @@ class PatternMemory:
                             events_to_insert
                         )
 
+                    # Save top 15 outlier videos to database
+                    df_outliers = df_total.sort_values("Multiplicador", ascending=False).head(15)
+                    videos_to_insert = []
+                    for _, row_video in df_outliers.iterrows():
+                        videos_to_insert.append((
+                            analysis_id,
+                            str(row_video.get("Title", "")),
+                            str(row_video.get("Channel", "")),
+                            str(row_video.get("Subscribers", "")),
+                            int(row_video.get("Views", 0) or 0),
+                            str(row_video.get("Published", "")),
+                            str(row_video.get("URL", "")),
+                            str(row_video.get("Thumbnail", "")),
+                            float(row_video.get("Multiplicador", 0.0) or 0.0),
+                            str(row_video.get("Keyword_Origen", "")),
+                            now
+                        ))
+                    if videos_to_insert:
+                        import psycopg2.extras
+                        psycopg2.extras.execute_values(
+                            cur,
+                            """
+                            INSERT INTO saved_videos
+                            (analysis_id, title, channel, subscribers, views, published, url, thumbnail, multiplier, keyword_origen, created_at)
+                            VALUES %s
+                            """,
+                            videos_to_insert
+                        )
+
                     self._save_graph_edges_with_cursor(cur, analysis_id, graph_patterns, now)
 
             # Clear specific caches so the UI updates on next rerun
@@ -446,6 +511,7 @@ class PatternMemory:
             get_cached_leaderboard.clear()
             get_cached_recent_analyses.clear()
             get_cached_graph_edges.clear()
+            get_cached_saved_videos.clear()
 
             return analysis_id
         finally:
@@ -862,9 +928,39 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
 
     nodes_payload = []
     allowed_ids = set(nodes_df["id"].tolist())
+    nodes_ordered = nodes_df.sort_values("weight", ascending=False).reset_index(drop=True)
+    type_ring = {
+        "nicho": 0,
+        "title_format": 1,
+        "keyword_token": 2,
+        "title_bigram": 3,
+        "title_token": 4,
+        "idea_title_token": 5,
+        "idea_title_bigram": 5,
+        "transcript": 6,
+        "unknown": 6
+    }
 
-    for _, row in nodes_df.iterrows():
+    ring_counts = Counter([type_ring.get(str(t), 6) for t in nodes_ordered["type"].tolist()])
+    ring_seen = Counter()
+
+    for _, row in nodes_ordered.iterrows():
         size = 12 + min(float(row["weight"]) * 2.3, 34)
+        ring = type_ring.get(str(row["type"]), 6)
+        ring_seen[ring] += 1
+        count_in_ring = max(1, ring_counts[ring])
+        index_in_ring = ring_seen[ring] - 1
+
+        if ring == 0:
+            x_pos = 0
+            y_pos = 0
+        else:
+            radius = 95 + ring * 92
+            angle_offset = (int(hashlib.sha256(str(row["id"]).encode("utf-8")).hexdigest()[:6], 16) % 360) / 360
+            angle = 2 * np.pi * ((index_in_ring / count_in_ring) + angle_offset / max(8, count_in_ring))
+            x_pos = float(np.cos(angle) * radius)
+            y_pos = float(np.sin(angle) * radius)
+
         nodes_payload.append({
             "id": row["id"],
             "label": str(row["label"])[:34],
@@ -873,7 +969,10 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
             "color": neural_node_color(str(row["type"])),
             "font": {"color": "#f8fafc", "size": 18 if size > 24 else 14},
             "shape": "dot",
-            "size": size
+            "size": size,
+            "x": x_pos,
+            "y": y_pos,
+            "fixed": {"x": True, "y": True}
         })
 
     edges_payload = []
@@ -1047,22 +1146,11 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
             hover: true,
             tooltipDelay: 80,
             navigationButtons: true,
-            keyboard: true
+            keyboard: true,
+            dragNodes: false
           }},
           physics: {{
-            enabled: true,
-            solver: "forceAtlas2Based",
-            forceAtlas2Based: {{
-              gravitationalConstant: -100,
-              centralGravity: 0.01,
-              springLength: 130,
-              springConstant: 0.08,
-              damping: 0.6
-            }},
-            stabilization: {{
-              enabled: true,
-              iterations: 2000
-            }}
+            enabled: false
           }},
           edges: {{
             smooth: {{ type: "continuous" }},
@@ -1076,10 +1164,7 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
         }};
         
         const network = new vis.Network(container, data, options);
-        
-        network.once("stabilized", function () {{
-            network.setOptions({{ physics: false }});
-        }});
+        network.moveTo({{ scale: 0.82 }});
         const panel = document.getElementById("details-panel");
         
         function formatNumber(num) {{
@@ -1172,6 +1257,109 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
     """
 
     components.html(html_doc, height=height + 20, scrolling=False)
+
+
+def analizar_grafo_neural(nodes_df, edges_df):
+    # ESTO SIRVE PARA APLICAR MATEMATICAS DE GRAFO:
+    # CENTRALIDAD, PAGERANK, COMUNIDADES Y NODOS PUENTE.
+    if nodes_df.empty or edges_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    node_ids = set(nodes_df["id"].astype(str).tolist())
+    adjacency = {node_id: Counter() for node_id in node_ids}
+
+    for _, row in edges_df.iterrows():
+        src = str(row.get("from", ""))
+        tgt = str(row.get("to", ""))
+        weight = float(row.get("total_weight", 0) or 0)
+
+        if src not in node_ids or tgt not in node_ids or src == tgt:
+            continue
+
+        adjacency[src][tgt] += weight
+        adjacency[tgt][src] += weight
+
+    if not adjacency:
+        return pd.DataFrame(), pd.DataFrame()
+
+    pagerank = {node: 1.0 / max(1, len(adjacency)) for node in adjacency}
+    damping = 0.85
+
+    for _ in range(35):
+        new_rank = {node: (1 - damping) / max(1, len(adjacency)) for node in adjacency}
+
+        for node, neighbors in adjacency.items():
+            total_weight = sum(neighbors.values())
+            if total_weight <= 0:
+                continue
+
+            for neighbor, weight in neighbors.items():
+                new_rank[neighbor] += damping * pagerank[node] * (weight / total_weight)
+
+        pagerank = new_rank
+
+    communities = {node: node for node in adjacency}
+
+    for _ in range(18):
+        changed = False
+        for node, neighbors in sorted(adjacency.items(), key=lambda item: len(item[1]), reverse=True):
+            votes = Counter()
+            for neighbor, weight in neighbors.items():
+                votes[communities[neighbor]] += weight
+
+            if votes:
+                best = votes.most_common(1)[0][0]
+                if communities[node] != best:
+                    communities[node] = best
+                    changed = True
+
+        if not changed:
+            break
+
+    community_ids = {}
+    for community in communities.values():
+        if community not in community_ids:
+            community_ids[community] = len(community_ids) + 1
+
+    rows = []
+    node_meta = nodes_df.set_index("id").to_dict(orient="index")
+
+    for node, neighbors in adjacency.items():
+        degree = len(neighbors)
+        strength = sum(neighbors.values())
+        neighbor_communities = {community_ids.get(communities[n], 0) for n in neighbors}
+        bridge_score = len(neighbor_communities) * np.log1p(degree) * np.log1p(strength)
+        meta = node_meta.get(node, {})
+
+        rows.append({
+            "Nodo": meta.get("label", node),
+            "Tipo": meta.get("type", "unknown"),
+            "Comunidad": community_ids.get(communities[node], 0),
+            "PageRank": round(float(pagerank.get(node, 0)), 5),
+            "Grado": int(degree),
+            "Fuerza": round(float(strength), 2),
+            "Nodo puente": round(float(bridge_score), 2)
+        })
+
+    metrics_df = pd.DataFrame(rows)
+
+    if metrics_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    community_rows = []
+    for community_id, group in metrics_df.groupby("Comunidad"):
+        top_nodes = group.sort_values("PageRank", ascending=False).head(6)["Nodo"].tolist()
+        community_rows.append({
+            "Comunidad": int(community_id),
+            "Nodos": int(len(group)),
+            "Fuerza total": round(float(group["Fuerza"].sum()), 2),
+            "Conceptos centrales": ", ".join(top_nodes)
+        })
+
+    communities_df = pd.DataFrame(community_rows).sort_values("Fuerza total", ascending=False)
+    metrics_df = metrics_df.sort_values(["PageRank", "Fuerza"], ascending=False)
+
+    return metrics_df, communities_df
 
 
 def build_analysis_signature(seeds, df_total):
@@ -2784,11 +2972,12 @@ def extract_current_search_graph(seeds, df_total, ideas, guiones_data, final_sco
 
 
 # Define tabs immediately
-tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_mapa = st.tabs([
+tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_feed, tab_mapa = st.tabs([
     "Videos outliers",
     "Nicho",
     "Ideas validadas",
     "Canales validados",
+    "Feed recomendado",
     "Mapa neural"
 ])
 
@@ -3062,6 +3251,39 @@ with tab_canales:
     else:
         st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
 
+with tab_feed:
+    if search_active:
+        st.markdown("## Feed recomendado de los outliers")
+        st.caption(
+            "Estos videos salen del feed lateral de YouTube alrededor de tus mejores outliers. "
+            "Son pistas de afinidad: hacia donde YouTube podria estar moviendo trafico dentro del nicho."
+        )
+
+        recommended_rows = st.session_state.get("recommended_data", [])
+
+        if not recommended_rows:
+            st.info("No hay recomendados todavia. Sube 'Videos fuente para feed recomendado' y lanza otra busqueda.")
+        else:
+            recommended_df = pd.DataFrame(recommended_rows).drop_duplicates(subset=["URL"])
+            st.metric("Videos recomendados detectados", len(recommended_df))
+
+            cols_feed = st.columns(3)
+            for i, (_, row) in enumerate(recommended_df.head(36).iterrows()):
+                with cols_feed[i % 3]:
+                    st.image(row.get("Thumbnail", ""), use_container_width=True)
+                    st.markdown(f"**{row.get('Title', '')}**")
+                    st.caption(
+                        f"{row.get('Channel', '')} · {int(row.get('Views', 0) or 0):,} views · "
+                        f"{row.get('Published', 'Unknown')}"
+                    )
+                    st.caption(f"Sale desde: {str(row.get('Source_Title', ''))[:90]}")
+                    st.markdown(f"[Abrir video]({row.get('URL', '')})")
+
+            with st.expander("Ver tabla completa del feed recomendado"):
+                st.dataframe(recommended_df, use_container_width=True)
+    else:
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+
 with tab_mapa:
     st.markdown("## Mapa neural de memoria IA")
     st.caption(
@@ -3136,11 +3358,62 @@ with tab_mapa:
                 "Keyword_Origen": str(row.get("Keyword_Origen", ""))
             })
 
+    # Load historical saved videos from database and merge them
+    db_videos = get_cached_saved_videos()
+    if not db_videos.empty:
+        seen_urls = {v["URL"] for v in videos_payload}
+        for _, row in db_videos.iterrows():
+            url = str(row.get("URL", ""))
+            if url not in seen_urls:
+                seen_urls.add(url)
+                videos_payload.append({
+                    "Title": str(row.get("Title", "")),
+                    "Channel": str(row.get("Channel", "")),
+                    "Subscribers": str(row.get("Subscribers", "")),
+                    "Views": int(row.get("Views", 0)),
+                    "Published": str(row.get("Published", "")),
+                    "URL": url,
+                    "Thumbnail": str(row.get("Thumbnail", "")),
+                    "Multiplicador": float(row.get("Multiplicador", 0.0)),
+                    "Keyword_Origen": str(row.get("Keyword_Origen", ""))
+                })
+
     with c_graph3:
         st.metric("Nodos", 0 if nodes_graph.empty else len(nodes_graph))
         st.metric("Conexiones", 0 if edges_graph.empty else len(edges_graph))
 
     render_neural_graph(nodes_graph, edges_graph, videos_payload, height=720)
+
+    st.markdown("## Modelo matematico del grafo")
+    st.caption(
+        "PageRank detecta conceptos centrales. Comunidad agrupa ideas cercanas. Nodo puente encuentra conexiones raras entre bloques distintos."
+    )
+
+    graph_metrics_df, graph_communities_df = analizar_grafo_neural(nodes_graph, edges_graph)
+
+    if graph_metrics_df.empty:
+        st.info("Aun no hay suficiente grafo para calcular metricas.")
+    else:
+        c_math1, c_math2 = st.columns(2)
+
+        with c_math1:
+            st.markdown("### Conceptos centrales")
+            st.dataframe(
+                graph_metrics_df[["Nodo", "Tipo", "Comunidad", "PageRank", "Grado", "Fuerza"]].head(25),
+                use_container_width=True
+            )
+
+        with c_math2:
+            st.markdown("### Nodos puente")
+            st.dataframe(
+                graph_metrics_df.sort_values("Nodo puente", ascending=False)[
+                    ["Nodo", "Tipo", "Comunidad", "Nodo puente", "Grado", "Fuerza"]
+                ].head(25),
+                use_container_width=True
+            )
+
+        st.markdown("### Comunidades de ideas")
+        st.dataframe(graph_communities_df.head(20), use_container_width=True)
 
     with st.expander("Ver datos del mapa"):
         st.markdown("### Nodos mas fuertes")
