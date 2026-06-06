@@ -91,9 +91,159 @@ require_access_code()
 # LA APP USA ESTO PARA COMPARAR NUEVAS BUSQUEDAS CON LO APRENDIDO.
 # =========================================================
 
+@st.cache_resource
+def _initialize_postgresql_database():
+    import psycopg2
+    import streamlit as st
+    creds = st.secrets["postgres"]
+    conn = psycopg2.connect(
+        host=creds["host"],
+        database=creds["database"],
+        user=creds["user"],
+        password=creds["password"],
+        port=creds.get("port", 5432)
+    )
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS analyses (
+                        id SERIAL PRIMARY KEY,
+                        created_at TEXT,
+                        seeds TEXT,
+                        final_score DOUBLE PRECISION,
+                        auto_score DOUBLE PRECISION,
+                        reading TEXT,
+                        color_rgb TEXT,
+                        total_videos INTEGER,
+                        notes TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pattern_events (
+                        id SERIAL PRIMARY KEY,
+                        analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
+                        pattern_type TEXT,
+                        pattern_value TEXT,
+                        weight DOUBLE PRECISION,
+                        created_at TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS graph_edges (
+                        id SERIAL PRIMARY KEY,
+                        analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
+                        source_type TEXT,
+                        source_value TEXT,
+                        target_type TEXT,
+                        target_value TEXT,
+                        weight DOUBLE PRECISION,
+                        created_at TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS request_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        payload TEXT,
+                        created_at DOUBLE PRECISION
+                    );
+                """)
+    finally:
+        conn.close()
+    return True
+
+@st.cache_data
+def get_cached_analyses_count():
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS total FROM analyses")
+                return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+@st.cache_data
+def get_cached_pattern_stats():
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+                    FROM pattern_events
+                    GROUP BY pattern_type, pattern_value
+                """)
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    stats = {}
+    for row in rows:
+        stats[(row[0], row[1])] = {
+            "uses": int(row[2]),
+            "avg_weight": float(row[3])
+        }
+    return stats
+
+@st.cache_data
+def get_cached_leaderboard(limit):
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        return pd.read_sql_query("""
+            SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
+            FROM pattern_events
+            GROUP BY pattern_type, pattern_value
+            HAVING COUNT(*) >= 2
+            ORDER BY avg_weight DESC, uses DESC
+            LIMIT %s
+        """, conn, params=(limit,))
+    finally:
+        conn.close()
+
+@st.cache_data
+def get_cached_recent_analyses(limit):
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        return pd.read_sql_query("""
+            SELECT created_at, seeds, final_score, auto_score, reading, total_videos
+            FROM analyses
+            ORDER BY id DESC
+            LIMIT %s
+        """, conn, params=(limit,))
+    finally:
+        conn.close()
+
+@st.cache_data
+def get_cached_graph_edges(limit_edges, min_edge_weight):
+    mem = PatternMemory()
+    conn = mem.get_conn()
+    try:
+        return pd.read_sql_query("""
+            SELECT
+                source_type,
+                source_value,
+                target_type,
+                target_value,
+                COUNT(*) AS uses,
+                SUM(weight) AS total_weight,
+                AVG(weight) AS avg_weight
+            FROM graph_edges
+            GROUP BY source_type, source_value, target_type, target_value
+            HAVING SUM(weight) >= %s
+            ORDER BY total_weight DESC, uses DESC
+            LIMIT %s
+        """, conn, params=(min_edge_weight, limit_edges))
+    finally:
+        conn.close()
+
 class PatternMemory:
     def __init__(self):
-        self.setup()
+        _initialize_postgresql_database()
 
     def get_conn(self):
         import psycopg2
@@ -121,54 +271,7 @@ class PatternMemory:
             conn.close()
 
     def setup(self):
-        conn = self.get_conn()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS analyses (
-                            id SERIAL PRIMARY KEY,
-                            created_at TEXT,
-                            seeds TEXT,
-                            final_score DOUBLE PRECISION,
-                            auto_score DOUBLE PRECISION,
-                            reading TEXT,
-                            color_rgb TEXT,
-                            total_videos INTEGER,
-                            notes TEXT
-                        );
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS pattern_events (
-                            id SERIAL PRIMARY KEY,
-                            analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
-                            pattern_type TEXT,
-                            pattern_value TEXT,
-                            weight DOUBLE PRECISION,
-                            created_at TEXT
-                        );
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS graph_edges (
-                            id SERIAL PRIMARY KEY,
-                            analysis_id INTEGER REFERENCES analyses(id) ON DELETE CASCADE,
-                            source_type TEXT,
-                            source_value TEXT,
-                            target_type TEXT,
-                            target_value TEXT,
-                            weight DOUBLE PRECISION,
-                            created_at TEXT
-                        );
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS request_cache (
-                            cache_key TEXT PRIMARY KEY,
-                            payload TEXT,
-                            created_at DOUBLE PRECISION
-                        );
-                    """)
-        finally:
-            conn.close()
+        pass
 
     def cache_get(self, cache_key, ttl_seconds=None):
         # ESTO SIRVE PARA NO PEDIR A YOUTUBE LO MISMO UNA Y OTRA VEZ.
@@ -220,6 +323,13 @@ class PatternMemory:
         now = datetime.utcnow().isoformat(timespec="seconds")
         seeds_text = ", ".join(seeds) if isinstance(seeds, list) else str(seeds)
 
+    def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
+        if df_total is None or df_total.empty:
+            return None
+
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        seeds_text = ", ".join(seeds) if isinstance(seeds, list) else str(seeds)
+
         conn = self.get_conn()
         try:
             with conn:
@@ -263,6 +373,8 @@ class PatternMemory:
 
                     self._save_graph_edges_with_cursor(cur, analysis_id, graph_patterns, now)
 
+            # Clear the cache so the UI updates
+            st.cache_data.clear()
             return analysis_id
         finally:
             conn.close()
@@ -299,14 +411,7 @@ class PatternMemory:
                 ))
 
     def predict_opportunity(self, seeds, df_total, color_rgb=None, ideas=None):
-        conn = self.get_conn()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) AS total FROM analyses")
-                    history_count = cur.fetchone()[0]
-        finally:
-            conn.close()
+        history_count = get_cached_analyses_count()
 
         if history_count < 3:
             return {
@@ -383,51 +488,13 @@ class PatternMemory:
         }
 
     def leaderboard(self, limit=30):
-        conn = self.get_conn()
-        try:
-            return pd.read_sql_query("""
-                SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
-                FROM pattern_events
-                GROUP BY pattern_type, pattern_value
-                HAVING COUNT(*) >= 2
-                ORDER BY avg_weight DESC, uses DESC
-                LIMIT %s
-            """, conn, params=(limit,))
-        finally:
-            conn.close()
+        return get_cached_leaderboard(limit)
 
     def recent_analyses(self, limit=10):
-        conn = self.get_conn()
-        try:
-            return pd.read_sql_query("""
-                SELECT created_at, seeds, final_score, auto_score, reading, total_videos
-                FROM analyses
-                ORDER BY id DESC
-                LIMIT %s
-            """, conn, params=(limit,))
-        finally:
-            conn.close()
+        return get_cached_recent_analyses(limit)
 
     def graph_data(self, limit_edges=220, min_edge_weight=0.08):
-        conn = self.get_conn()
-        try:
-            edges = pd.read_sql_query("""
-                SELECT
-                    source_type,
-                    source_value,
-                    target_type,
-                    target_value,
-                    COUNT(*) AS uses,
-                    SUM(weight) AS total_weight,
-                    AVG(weight) AS avg_weight
-                FROM graph_edges
-                GROUP BY source_type, source_value, target_type, target_value
-                HAVING SUM(weight) >= %s
-                ORDER BY total_weight DESC, uses DESC
-                LIMIT %s
-            """, conn, params=(min_edge_weight, limit_edges))
-        finally:
-            conn.close()
+        edges = get_cached_graph_edges(limit_edges, min_edge_weight)
 
         if edges.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -502,22 +569,7 @@ class PatternMemory:
         return patterns
 
     def pattern_stats(self):
-        conn = self.get_conn()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT pattern_type, pattern_value, COUNT(*) AS uses, AVG(weight) AS avg_weight
-                        FROM pattern_events
-                        GROUP BY pattern_type, pattern_value
-                    """)
-                    rows = cur.fetchall()
-        finally:
-            conn.close()
-
-        stats = {}
-        for row in rows:
-            stats[(row[0], row[1])] = {
+        return get_cached_pattern_stats()
                 "uses": int(row[2]),
                 "avg_weight": float(row[3])
             }
@@ -738,7 +790,6 @@ def build_analysis_signature(seeds, df_total):
 
 def autosave_analysis_once(seeds, df_total, final_score, auto_score, reading, color_rgb, ideas):
     # ESTO GUARDA CADA BUSQUEDA EN LA MEMORIA IA UNA SOLA VEZ.
-    # NO GUARDA IP, EMAIL, NOMBRE NI DATOS PERSONALES.
     if not AUTO_SAVE_SEARCHES_TO_MEMORY:
         return None
 
@@ -751,21 +802,32 @@ def autosave_analysis_once(seeds, df_total, final_score, auto_score, reading, co
     if signature in saved:
         return None
 
-    analysis_id = memoria.save_analysis(
-        seeds,
-        df_total,
-        final_score,
-        auto_score,
-        reading,
-        color_rgb,
-        ideas,
-        notes="Guardado automatico sin datos personales"
-    )
-
+    # Guardar firma localmente para no repetir
     saved.add(signature)
     st.session_state.saved_analysis_signatures = saved
-    st.session_state.last_saved_analysis_id = analysis_id
-    return analysis_id
+
+    # Guardar en base de datos en segundo plano sin bloquear la UI
+    def save_background():
+        try:
+            mem = PatternMemory()
+            mem.save_analysis(
+                seeds,
+                df_total,
+                final_score,
+                auto_score,
+                reading,
+                color_rgb,
+                ideas,
+                notes="Guardado automatico en segundo plano"
+            )
+        except Exception:
+            pass
+
+    import threading
+    t = threading.Thread(target=save_background, daemon=True)
+    t.start()
+
+    return "background"
 
 
 # =========================================================
@@ -2274,8 +2336,10 @@ autosaved_id = autosave_analysis_once(
     ideas
 )
 
-if autosaved_id:
-    st.success(f"Busqueda guardada automaticamente en memoria IA con ID {autosaved_id}.")
+if autosaved_id == "background":
+    st.toast("💾 Guardando análisis en la base de datos en segundo plano...", icon="☁️")
+elif autosaved_id:
+    st.success(f"Búsqueda guardada en memoria con ID {autosaved_id}.")
 
 tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_mapa, tab_memoria = st.tabs([
     "Videos outliers",
