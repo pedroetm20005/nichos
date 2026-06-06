@@ -8,6 +8,7 @@ import html
 import hashlib
 import pandas as pd
 import numpy as np
+import streamlit.components.v1 as components
 from urllib.parse import quote
 from collections import Counter
 from pathlib import Path
@@ -74,14 +75,13 @@ def require_access_code():
     st.stop()
 
 
-require_access_code()
-
-
 st.set_page_config(
     page_title="Minero Multinicho Pro v4.0",
     page_icon="brain",
     layout="wide"
 )
+
+require_access_code()
 
 
 # =========================================================
@@ -120,6 +120,17 @@ class PatternMemory:
                 weight REAL,
                 created_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS graph_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER,
+                source_type TEXT,
+                source_value TEXT,
+                target_type TEXT,
+                target_value TEXT,
+                weight REAL,
+                created_at TEXT
+            );
         """)
         self.conn.commit()
 
@@ -146,6 +157,7 @@ class PatternMemory:
         ))
 
         analysis_id = cur.lastrowid
+        graph_patterns = Counter()
 
         for _, row in df_total.iterrows():
             weight = self.video_weight(row)
@@ -155,6 +167,7 @@ class PatternMemory:
                     (analysis_id, pattern_type, pattern_value, weight, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 """, (analysis_id, pattern_type, pattern_value, weight, now))
+                graph_patterns[(pattern_type, pattern_value)] += weight
 
         for idea in ideas or []:
             for pattern_type, pattern_value in self.extract_title_patterns(str(idea)):
@@ -163,9 +176,45 @@ class PatternMemory:
                     (analysis_id, pattern_type, pattern_value, weight, created_at)
                     VALUES (?, ?, ?, ?, ?)
                 """, (analysis_id, "idea_" + pattern_type, pattern_value, final_score / 100, now))
+                graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
+
+        self.save_graph_edges(analysis_id, graph_patterns, now)
 
         self.conn.commit()
         return analysis_id
+
+    def save_graph_edges(self, analysis_id, graph_patterns, created_at):
+        # ESTO CREA CONEXIONES ENTRE PATRONES QUE APARECEN JUNTOS EN UNA BUSQUEDA.
+        # EJEMPLO: "secret" + "dragon" + "canal pequeno" + "outlier alto".
+        if not graph_patterns:
+            return
+
+        top_patterns = graph_patterns.most_common(35)
+
+        for i in range(len(top_patterns)):
+            (source_type, source_value), source_weight = top_patterns[i]
+
+            for j in range(i + 1, min(i + 12, len(top_patterns))):
+                (target_type, target_value), target_weight = top_patterns[j]
+
+                if source_type == target_type and source_value == target_value:
+                    continue
+
+                edge_weight = float(min(source_weight, target_weight))
+
+                self.conn.execute("""
+                    INSERT INTO graph_edges
+                    (analysis_id, source_type, source_value, target_type, target_value, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    analysis_id,
+                    source_type,
+                    source_value,
+                    target_type,
+                    target_value,
+                    edge_weight,
+                    created_at
+                ))
 
     def predict_opportunity(self, seeds, df_total, color_rgb=None, ideas=None):
         history_count = self.conn.execute("SELECT COUNT(*) AS total FROM analyses").fetchone()["total"]
@@ -261,6 +310,47 @@ class PatternMemory:
             ORDER BY id DESC
             LIMIT ?
         """, self.conn, params=(limit,))
+
+    def graph_data(self, limit_edges=220, min_edge_weight=0.08):
+        # ESTO DEVUELVE LAS CONEXIONES DE MEMORIA PARA PINTAR EL MAPA NEURAL.
+        edges = pd.read_sql_query("""
+            SELECT
+                source_type,
+                source_value,
+                target_type,
+                target_value,
+                COUNT(*) AS uses,
+                SUM(weight) AS total_weight,
+                AVG(weight) AS avg_weight
+            FROM graph_edges
+            GROUP BY source_type, source_value, target_type, target_value
+            HAVING total_weight >= ?
+            ORDER BY total_weight DESC, uses DESC
+            LIMIT ?
+        """, self.conn, params=(min_edge_weight, limit_edges))
+
+        if edges.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        node_counter = Counter()
+
+        for _, row in edges.iterrows():
+            source_id = f"{row['source_type']}::{row['source_value']}"
+            target_id = f"{row['target_type']}::{row['target_value']}"
+            node_counter[source_id] += float(row["total_weight"])
+            node_counter[target_id] += float(row["total_weight"])
+
+        nodes = []
+        for node_id, weight in node_counter.items():
+            node_type, node_value = node_id.split("::", 1)
+            nodes.append({
+                "id": node_id,
+                "label": node_value,
+                "type": node_type,
+                "weight": weight
+            })
+
+        return pd.DataFrame(nodes), edges
 
     def extract_video_patterns(self, row):
         title = str(row.get("Title", ""))
@@ -392,6 +482,134 @@ def format_pattern(pattern_item):
 
 
 memoria = PatternMemory("data/pattern_memory.sqlite")
+
+
+def neural_node_color(node_type):
+    if "title_token" in node_type:
+        return "#3f7df4"
+    if "title_bigram" in node_type:
+        return "#7c4dff"
+    if "title_format" in node_type:
+        return "#ff4f7b"
+    if "keyword" in node_type:
+        return "#00b894"
+    if "recency" in node_type:
+        return "#ffb703"
+    if "idea" in node_type:
+        return "#f97316"
+    if "color" in node_type:
+        return "#22c55e"
+    return "#94a3b8"
+
+
+def render_neural_graph(nodes_df, edges_df, height=720):
+    # ESTO PINTA EL MAPA TIPO OBSIDIAN. USA VIS-NETWORK EN HTML.
+    if nodes_df.empty or edges_df.empty:
+        st.info("Aun no hay conexiones suficientes. Haz varias busquedas y deja que la memoria IA guarde patrones.")
+        return
+
+    nodes_payload = []
+    allowed_ids = set(nodes_df["id"].tolist())
+
+    for _, row in nodes_df.iterrows():
+        size = 12 + min(float(row["weight"]) * 2.3, 34)
+        nodes_payload.append({
+            "id": row["id"],
+            "label": str(row["label"])[:34],
+            "title": f"{row['type']}: {row['label']} | peso {float(row['weight']):.2f}",
+            "value": float(row["weight"]),
+            "color": neural_node_color(str(row["type"])),
+            "font": {"color": "#f8fafc", "size": 18 if size > 24 else 14},
+            "shape": "dot",
+            "size": size
+        })
+
+    edges_payload = []
+    for _, row in edges_df.iterrows():
+        source_id = f"{row['source_type']}::{row['source_value']}"
+        target_id = f"{row['target_type']}::{row['target_value']}"
+
+        if source_id not in allowed_ids or target_id not in allowed_ids:
+            continue
+
+        weight = float(row["total_weight"])
+        edges_payload.append({
+            "from": source_id,
+            "to": target_id,
+            "value": weight,
+            "width": 1 + min(weight, 8),
+            "title": f"Conexion: {int(row['uses'])} usos | peso {weight:.2f}",
+            "color": {"color": "rgba(148, 163, 184, 0.42)"}
+        })
+
+    html_doc = f"""
+    <html>
+    <head>
+      <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+      <style>
+        body {{
+          margin: 0;
+          background: #080d16;
+          color: #f8fafc;
+          font-family: Inter, Arial, sans-serif;
+        }}
+        #network {{
+          width: 100%;
+          height: {height}px;
+          border: 1px solid rgba(255,255,255,.12);
+          border-radius: 10px;
+          background:
+            radial-gradient(circle at 50% 0%, rgba(63,125,244,.20), transparent 36%),
+            #080d16;
+        }}
+      </style>
+    </head>
+    <body>
+      <div id="network"></div>
+      <script>
+        const nodes = new vis.DataSet({json.dumps(nodes_payload)});
+        const edges = new vis.DataSet({json.dumps(edges_payload)});
+        const container = document.getElementById("network");
+        const data = {{ nodes, edges }};
+        const options = {{
+          interaction: {{
+            hover: true,
+            tooltipDelay: 80,
+            navigationButtons: true,
+            keyboard: true
+          }},
+          physics: {{
+            enabled: true,
+            solver: "forceAtlas2Based",
+            forceAtlas2Based: {{
+              gravitationalConstant: -80,
+              centralGravity: 0.015,
+              springLength: 150,
+              springConstant: 0.08,
+              damping: 0.55
+            }},
+            stabilization: {{
+              enabled: true,
+              iterations: 180
+            }}
+          }},
+          edges: {{
+            smooth: {{ type: "continuous" }},
+            scaling: {{ min: 1, max: 8 }}
+          }},
+          nodes: {{
+            borderWidth: 1,
+            borderWidthSelected: 3,
+            scaling: {{ min: 10, max: 45 }}
+          }}
+        }};
+        new vis.Network(container, data, options);
+      </script>
+    </body>
+    </html>
+    """
+
+    components.html(html_doc, height=height + 20, scrolling=False)
 
 
 def build_analysis_signature(seeds, df_total):
@@ -1795,11 +2013,12 @@ autosaved_id = autosave_analysis_once(
 if autosaved_id:
     st.success(f"Busqueda guardada automaticamente en memoria IA con ID {autosaved_id}.")
 
-tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_memoria = st.tabs([
+tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_mapa, tab_memoria = st.tabs([
     "Videos outliers",
     "Nicho",
     "Ideas validadas",
     "Canales validados",
+    "Mapa neural",
     "Memoria IA"
 ])
 
@@ -1892,13 +2111,13 @@ with tab_nicho:
     else:
         st.info("Aun no hay suficientes senales para sugerir nichos similares.")
 
-    st.markdown("### ")
+    st.markdown("### Direccion de miniatura")
     st.write(f"Color dominante detectado: RGB {color_patron}")
 
     for instruccion in generar_direccion_miniatura(df_total, color_patron):
         st.write(f"- {instruccion}")
 
-    st.markdown("### ")
+    st.markdown("### Generador de base de miniatura basado en datos")
 
     if st.button("Analizar miniaturas ganadoras y generar base"):
         patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
@@ -1911,13 +2130,13 @@ with tab_ideas:
 
     st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=260)
 
-    st.markdown("## brain Cajas de extraccion rapida")
+    st.markdown("## Cajas de extraccion rapida")
 
     c1, c2 = st.columns(2)
     semilla_referencia = df_total["Keyword_Origen"].iloc[0] if not df_total.empty else "video"
 
     with c1:
-        st.markdown("### ")
+        st.markdown("### Basado en titulos ganadores")
 
         titulos_buenos = df_total["Title"].tolist()
         stopwords_titulos = {
@@ -1961,7 +2180,7 @@ with tab_ideas:
         else:
             st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
 
-    st.markdown("##  Radar de transcripciones")
+    st.markdown("## Radar de transcripciones")
 
     if "guiones_data" in st.session_state and st.session_state.guiones_data:
         for i, guion in enumerate(st.session_state.guiones_data, start=1):
@@ -2007,6 +2226,48 @@ with tab_canales:
             column_config={"Link": st.column_config.LinkColumn("Link")}
         )
 
+with tab_mapa:
+    st.markdown("## Mapa neural de memoria IA")
+    st.caption(
+        "Este mapa conecta patrones que aparecen juntos en las busquedas: tokens de titulo, formatos, keywords, ideas y recencia. "
+        "Cuanto mas grande el nodo, mas fuerte aparece en la memoria."
+    )
+
+    c_graph1, c_graph2, c_graph3 = st.columns([1, 1, 2])
+
+    with c_graph1:
+        graph_limit = st.slider("Conexiones maximas", 50, 500, 220, step=25)
+
+    with c_graph2:
+        min_weight = st.slider("Peso minimo", 0.01, 1.0, 0.08, step=0.01)
+
+    nodes_graph, edges_graph = memoria.graph_data(
+        limit_edges=graph_limit,
+        min_edge_weight=min_weight
+    )
+
+    with c_graph3:
+        st.metric("Nodos", 0 if nodes_graph.empty else len(nodes_graph))
+        st.metric("Conexiones", 0 if edges_graph.empty else len(edges_graph))
+
+    render_neural_graph(nodes_graph, edges_graph, height=720)
+
+    with st.expander("Ver datos del mapa"):
+        st.markdown("### Nodos mas fuertes")
+        if nodes_graph.empty:
+            st.info("Todavia no hay nodos.")
+        else:
+            st.dataframe(
+                nodes_graph.sort_values("weight", ascending=False).head(80),
+                use_container_width=True
+            )
+
+        st.markdown("### Conexiones mas fuertes")
+        if edges_graph.empty:
+            st.info("Todavia no hay conexiones.")
+        else:
+            st.dataframe(edges_graph.head(120), use_container_width=True)
+
 with tab_memoria:
     st.markdown("## Memoria IA")
 
@@ -2041,7 +2302,7 @@ with tab_memoria:
                 st.write(f'- {format_pattern(p)} | peso {p["avg_weight"]:.2f} | usos {p["uses"]}')
 
     if guardar_en_memoria:
-        if st.button(" Guardar resultado en memoria IA"):
+        if st.button("Guardar resultado en memoria IA"):
             score_final_mem, lectura_final_mem, _ = resumen_validacion_final(tabla_referencias, tabla_validacion)
 
             analysis_id = memoria.save_analysis(
