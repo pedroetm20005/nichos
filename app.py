@@ -841,6 +841,19 @@ def neural_node_color(node_type):
     return "#94a3b8"
 
 
+def clean_and_singularize_label(label):
+    label = str(label).lower().strip()
+    label = re.sub(r"[^\w\s]", " ", label)
+    label = re.sub(r"\s+", " ", label)
+    words = label.split()
+    clean_words = []
+    for w in words:
+        if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+            w = w[:-1]
+        clean_words.append(w)
+    return " ".join(clean_words).strip()
+
+
 def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
     # ESTO PINTA EL MAPA TIPO OBSIDIAN Y MUESTRA LOS VIDEOS EN UN PANEL INTERACTIVO AL PINCHAR.
     if nodes_df.empty or edges_df.empty:
