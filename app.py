@@ -574,30 +574,80 @@ class PatternMemory:
         return get_cached_recent_analyses(limit)
 
     def graph_data(self, limit_edges=220, min_edge_weight=0.08):
-        edges = get_cached_graph_edges(limit_edges, min_edge_weight)
+        edges_raw = get_cached_graph_edges(limit_edges, min_edge_weight)
 
-        if edges.empty:
+        if edges_raw.empty:
             return pd.DataFrame(), pd.DataFrame()
 
-        node_counter = Counter()
+        consolidated_edges = {}
+        node_weights = Counter()
+        node_types = {}
 
-        for _, row in edges.iterrows():
-            source_id = f"{row['source_type']}::{row['source_value']}"
-            target_id = f"{row['target_type']}::{row['target_value']}"
-            node_counter[source_id] += float(row["total_weight"])
-            node_counter[target_id] += float(row["total_weight"])
+        for _, row in edges_raw.iterrows():
+            # Filter out recency type nodes from mind map
+            if row["source_type"] == "recency" or row["target_type"] == "recency":
+                continue
 
-        nodes = []
-        for node_id, weight in node_counter.items():
-            node_type, node_value = node_id.split("::", 1)
-            nodes.append({
+            src_val = clean_and_singularize_label(row["source_value"])
+            tgt_val = clean_and_singularize_label(row["target_value"])
+            src_type = row["source_type"]
+            tgt_type = row["target_type"]
+            weight = float(row["total_weight"])
+            uses = int(row["uses"])
+
+            if not src_val or not tgt_val or src_val == tgt_val:
+                continue
+
+            # Consolidated undirected edges (alphabetical sorting to avoid bidirectional duplicate paths)
+            edge_key = tuple(sorted([src_val, tgt_val]))
+            
+            if edge_key not in consolidated_edges:
+                consolidated_edges[edge_key] = {
+                    "from": edge_key[0],
+                    "to": edge_key[1],
+                    "uses": 0,
+                    "total_weight": 0.0,
+                    "count": 0
+                }
+            
+            consolidated_edges[edge_key]["uses"] += uses
+            consolidated_edges[edge_key]["total_weight"] += weight
+            consolidated_edges[edge_key]["count"] += 1
+
+            node_weights[src_val] += weight
+            node_weights[tgt_val] += weight
+
+            # Retain the most descriptive type (prioritizing non-generic types)
+            if src_val not in node_types or src_type != "title_token":
+                node_types[src_val] = src_type
+            if tgt_val not in node_types or tgt_type != "title_token":
+                node_types[tgt_val] = tgt_type
+
+        if not consolidated_edges:
+            return pd.DataFrame(), pd.DataFrame()
+
+        edges_list = []
+        for edge in consolidated_edges.values():
+            edges_list.append({
+                "from": edge["from"],
+                "to": edge["to"],
+                "uses": edge["uses"],
+                "total_weight": edge["total_weight"],
+                "avg_weight": edge["total_weight"] / max(1, edge["count"])
+            })
+        edges_df = pd.DataFrame(edges_list)
+
+        nodes_list = []
+        for node_id, weight in node_weights.items():
+            nodes_list.append({
                 "id": node_id,
-                "label": node_value,
-                "type": node_type,
+                "label": node_id,
+                "type": node_types.get(node_id, "unknown"),
                 "weight": weight
             })
+        nodes_df = pd.DataFrame(nodes_list)
 
-        return pd.DataFrame(nodes), edges
+        return nodes_df, edges_df
 
     def extract_video_patterns(self, row):
         title = str(row.get("Title", ""))
@@ -707,11 +757,11 @@ class PatternMemory:
         clean = self.clean(text)
         tokens = []
         for w in clean.split():
-            if w in stopwords or len(w) <= 3:
+            if w in stopwords or len(w) <= 2:
                 continue
-            if w.endswith("s") and not w.endswith("ss") and len(w) > 4:
+            if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
                 w = w[:-1]
-            if w not in stopwords and len(w) > 3:
+            if w not in stopwords and len(w) >= 3:
                 tokens.append(w)
         return tokens
 
@@ -747,8 +797,21 @@ def neural_node_color(node_type):
     return "#94a3b8"
 
 
-def render_neural_graph(nodes_df, edges_df, height=720):
-    # ESTO PINTA EL MAPA TIPO OBSIDIAN. USA VIS-NETWORK EN HTML.
+def clean_and_singularize_label(label):
+    label = str(label).lower().strip()
+    label = re.sub(r"[^\w\s]", " ", label)
+    label = re.sub(r"\s+", " ", label)
+    words = label.split()
+    clean_words = []
+    for w in words:
+        if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+            w = w[:-1]
+        clean_words.append(w)
+    return " ".join(clean_words).strip()
+
+
+def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
+    # ESTO PINTA EL MAPA TIPO OBSIDIAN Y MUESTRA LOS VIDEOS EN UN PANEL INTERACTIVO AL PINCHAR.
     if nodes_df.empty or edges_df.empty:
         st.info("Aun no hay conexiones suficientes. Haz varias busquedas y deja que la memoria IA guarde patrones.")
         return
@@ -771,8 +834,8 @@ def render_neural_graph(nodes_df, edges_df, height=720):
 
     edges_payload = []
     for _, row in edges_df.iterrows():
-        source_id = f"{row['source_type']}::{row['source_value']}"
-        target_id = f"{row['target_type']}::{row['target_value']}"
+        source_id = row["from"]
+        target_id = row["to"]
 
         if source_id not in allowed_ids or target_id not in allowed_ids:
             continue
@@ -798,23 +861,142 @@ def render_neural_graph(nodes_df, edges_df, height=720):
           color: #f8fafc;
           font-family: Inter, Arial, sans-serif;
         }}
-        #network {{
+        #container {{
+          display: flex;
           width: 100%;
           height: {height}px;
           border: 1px solid rgba(255,255,255,.12);
           border-radius: 10px;
-          background:
-            radial-gradient(circle at 50% 0%, rgba(63,125,244,.20), transparent 36%),
-            #080d16;
+          background: #080d16;
+          overflow: hidden;
+        }}
+        #network-canvas {{
+          width: 70%;
+          height: 100%;
+          position: relative;
+          background: radial-gradient(circle at 50% 0%, rgba(63,125,244,.15), transparent 60%);
+        }}
+        #details-panel {{
+          width: 30%;
+          height: 100%;
+          background: rgba(11, 16, 27, 0.96);
+          border-left: 1px solid rgba(255, 255, 255, 0.1);
+          display: flex;
+          flex-direction: column;
+          color: #f8fafc;
+          overflow-y: auto;
+          padding: 16px;
+          box-sizing: border-box;
+        }}
+        .panel-header {{
+          font-size: 16px;
+          font-weight: 850;
+          margin-bottom: 12px;
+          padding-bottom: 8px;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+          color: #3f7df4;
+          text-transform: capitalize;
+        }}
+        .empty-state {{
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          height: 100%;
+          text-align: center;
+          color: #8d98aa;
+          font-size: 13px;
+          padding: 16px;
+        }}
+        .video-item {{
+          display: flex;
+          gap: 10px;
+          background: rgba(255, 255, 255, 0.03);
+          padding: 8px;
+          border-radius: 8px;
+          margin-bottom: 10px;
+          text-decoration: none;
+          color: inherit;
+          transition: background 0.2s, transform 0.2s;
+          border: 1px solid rgba(255, 255, 255, 0.05);
+        }}
+        .video-item:hover {{
+          background: rgba(255, 255, 255, 0.08);
+          transform: translateY(-2px);
+          border-color: rgba(63, 125, 244, 0.4);
+        }}
+        .video-thumb {{
+          width: 80px;
+          aspect-ratio: 16 / 9;
+          border-radius: 4px;
+          object-fit: cover;
+          background: #141b29;
+        }}
+        .video-info {{
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+          min-width: 0;
+        }}
+        .video-title {{
+          font-size: 12px;
+          font-weight: 700;
+          line-height: 1.25;
+          margin-bottom: 4px;
+          overflow: hidden;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          color: #f8fafc;
+        }}
+        .video-meta {{
+          font-size: 9px;
+          color: #8d98aa;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }}
+        .video-badge {{
+          display: inline-block;
+          padding: 1px 4px;
+          font-size: 8px;
+          font-weight: 900;
+          color: white;
+          border-radius: 4px;
+          margin-right: 4px;
+        }}
+        .score-hot {{ background: #ff2f63; }}
+        .score-mid {{ background: #a24be8; }}
+        .score-low {{ background: #3f7df4; }}
+        
+        @media (max-width: 768px) {{
+          #container {{
+            flex-direction: column;
+            height: auto;
+          }}
+          #network-canvas {{
+            width: 100%;
+            height: 450px;
+          }}
+          #details-panel {{
+            width: 100%;
+            height: 350px;
+            border-left: none;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+          }}
         }}
       </style>
     </head>
     <body>
-      <div id="network"></div>
+      <div id="container">
+        <div id="network-canvas"></div>
+        <div id="details-panel"></div>
+      </div>
       <script>
         const nodes = new vis.DataSet({json.dumps(nodes_payload)});
         const edges = new vis.DataSet({json.dumps(edges_payload)});
-        const container = document.getElementById("network");
+        const videos = {json.dumps(videos_list or [])};
+
+        const container = document.getElementById("network-canvas");
         const data = {{ nodes, edges }};
         const options = {{
           interaction: {{
@@ -827,15 +1009,15 @@ def render_neural_graph(nodes_df, edges_df, height=720):
             enabled: true,
             solver: "forceAtlas2Based",
             forceAtlas2Based: {{
-              gravitationalConstant: -80,
-              centralGravity: 0.015,
-              springLength: 150,
+              gravitationalConstant: -100,
+              centralGravity: 0.01,
+              springLength: 130,
               springConstant: 0.08,
-              damping: 0.55
+              damping: 0.6
             }},
             stabilization: {{
               enabled: true,
-              iterations: 180
+              iterations: 150
             }}
           }},
           edges: {{
@@ -848,7 +1030,94 @@ def render_neural_graph(nodes_df, edges_df, height=720):
             scaling: {{ min: 10, max: 45 }}
           }}
         }};
-        new vis.Network(container, data, options);
+        
+        const network = new vis.Network(container, data, options);
+        const panel = document.getElementById("details-panel");
+        
+        function formatNumber(num) {{
+            if (num >= 1000000) return (num / 1000000).toFixed(1) + "M";
+            if (num >= 1000) return (num / 1000).toFixed(0) + "K";
+            return num;
+        }}
+        
+        function getBadgeClass(multiplier) {{
+            if (multiplier >= 8) return "score-hot";
+            if (multiplier >= 4) return "score-mid";
+            return "score-low";
+        }}
+
+        function showVideosForNode(nodeLabel) {{
+            panel.innerHTML = "";
+            
+            const header = document.createElement("div");
+            header.className = "panel-header";
+            header.innerText = "Videos: \"" + nodeLabel + "\"";
+            panel.appendChild(header);
+            
+            const matches = videos.filter(v => {{
+                const title = (v.Title || "").toLowerCase();
+                const keyword = (v.Keyword_Origen || "").toLowerCase();
+                const cleanLabel = nodeLabel.toLowerCase();
+                return title.includes(cleanLabel) || keyword.includes(cleanLabel);
+            }});
+            
+            if (matches.length === 0) {{
+                const empty = document.createElement("div");
+                empty.className = "empty-state";
+                empty.innerText = "No se encontraron videos activos de esta tanda que contengan esta palabra.";
+                panel.appendChild(empty);
+                return;
+            }}
+            
+            // Sort matches by outlier multiplier descending
+            matches.sort((a, b) => b.Multiplicador - a.Multiplicador);
+            
+            matches.forEach(v => {{
+                const item = document.createElement("a");
+                item.className = "video-item";
+                item.href = v.URL;
+                item.target = "_blank";
+                
+                const badgeClass = getBadgeClass(v.Multiplicador);
+                
+                item.innerHTML = `
+                    <img class="video-thumb" src="${v.Thumbnail}" alt="">
+                    <div class="video-info" style="flex: 1; min-width: 0;">
+                        <div class="video-title">${v.Title}</div>
+                        <div style="display: flex; align-items: center; margin-bottom: 2px;">
+                            <span class="video-badge ${badgeClass}">${v.Multiplicador.toFixed(1)}x</span>
+                            <span class="video-meta" style="flex: 1;">${v.Channel}</span>
+                        </div>
+                        <div class="video-meta">${formatNumber(v.Views)} vistas - ${v.Published}</div>
+                    </div>
+                `;
+                panel.appendChild(item);
+            }});
+        }}
+        
+        network.on("selectNode", function (params) {{
+            const selectedNodeId = params.nodes[0];
+            const nodeData = nodes.get(selectedNodeId);
+            if (nodeData) {{
+                showVideosForNode(nodeData.label);
+            }}
+        }});
+        
+        network.on("deselectNode", function () {{
+            showDefaultPanel();
+        }});
+        
+        function showDefaultPanel() {{
+            panel.innerHTML = "";
+            const empty = document.createElement("div");
+            empty.className = "empty-state";
+            empty.innerHTML = videos.length > 0 
+                ? "👈 Haz clic en cualquier bola del mapa para ver los videos outliers de esta tanda."
+                : "Inicia una busqueda de nicho arriba para ver y explorar los videos outliers.";
+            panel.appendChild(empty);
+        }}
+        
+        showDefaultPanel();
       </script>
     </body>
     </html>
@@ -2376,51 +2645,53 @@ def extract_current_search_graph(seeds, df_total, ideas, final_score):
         return pd.DataFrame(), pd.DataFrame()
     
     graph_patterns = Counter()
+    pattern_types = {}
 
     for _, row in df_total.iterrows():
         weight = memoria.video_weight(row)
         for pattern_type, pattern_value in memoria.extract_video_patterns(row):
-            graph_patterns[(pattern_type, pattern_value)] += weight
+            if pattern_type == "recency":
+                continue
+            val = clean_and_singularize_label(pattern_value)
+            if val:
+                graph_patterns[val] += weight
+                pattern_types[val] = pattern_type
 
     for idea in ideas or []:
         for pattern_type, pattern_value in memoria.extract_title_patterns(str(idea)):
-            graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
+            val = clean_and_singularize_label(pattern_value)
+            if val:
+                graph_patterns[val] += final_score / 100
+                pattern_types[val] = "idea_" + pattern_type
 
     edges_payload = []
     top_patterns = graph_patterns.most_common(35)
     
     for i in range(len(top_patterns)):
-        (source_type, source_value), source_weight = top_patterns[i]
+        source_val, source_weight = top_patterns[i]
 
         for j in range(i + 1, min(i + 12, len(top_patterns))):
-            (target_type, target_value), target_weight = top_patterns[j]
+            target_val, target_weight = top_patterns[j]
 
-            if source_type == target_type and source_value == target_value:
+            if source_val == target_val:
                 continue
 
             edge_weight = float(min(source_weight, target_weight))
+            from_node, to_node = sorted([source_val, target_val])
             edges_payload.append({
-                "source_type": source_type,
-                "source_value": source_value,
-                "target_type": target_type,
-                "target_value": target_value,
+                "from": from_node,
+                "to": to_node,
                 "uses": 1,
                 "total_weight": edge_weight,
                 "avg_weight": edge_weight
             })
 
     nodes_payload = []
-    node_counter = Counter()
-    for (ptype, pval), weight in graph_patterns.items():
-        node_id = f"{ptype}::{pval}"
-        node_counter[node_id] += weight
-
-    for node_id, weight in node_counter.items():
-        node_type, node_value = node_id.split("::", 1)
+    for node_val, weight in graph_patterns.items():
         nodes_payload.append({
-            "id": node_id,
-            "label": node_value,
-            "type": node_type,
+            "id": node_val,
+            "label": node_val,
+            "type": pattern_types.get(node_val, "unknown"),
             "weight": weight
         })
 
@@ -2746,30 +3017,44 @@ with tab_mapa:
             if edges_db.empty:
                 edges_graph = edges_curr
             else:
-                edges_db["_key"] = edges_db["source_type"] + "::" + edges_db["source_value"] + "->" + edges_db["target_type"] + "::" + edges_db["target_value"]
-                edges_curr["_key"] = edges_curr["source_type"] + "::" + edges_curr["source_value"] + "->" + edges_curr["target_type"] + "::" + edges_curr["target_value"]
-                
                 combined_edges = pd.concat([edges_db, edges_curr])
-                grouped = combined_edges.groupby("_key").agg({
-                    "source_type": "first",
-                    "source_value": "first",
-                    "target_type": "first",
-                    "target_value": "first",
+                grouped = combined_edges.groupby(["from", "to"]).agg({
                     "uses": "sum",
                     "total_weight": "sum",
                     "avg_weight": "mean"
                 }).reset_index()
-                edges_graph = grouped.drop(columns=["_key"])
+                edges_graph = grouped
         else:
             nodes_graph, edges_graph = nodes_db, edges_db
     else:
         nodes_graph, edges_graph = nodes_db, edges_db
 
+    # ONLY KEEP NODES THAT HAVE AT LEAST ONE ACTIVE CONNECTION (Filters out disconnected outer ring nodes)
+    if not nodes_graph.empty and not edges_graph.empty:
+        connected_nodes = set(edges_graph["from"].tolist() + edges_graph["to"].tolist())
+        nodes_graph = nodes_graph[nodes_graph["id"].isin(connected_nodes)]
+
+    # Prepare videos list from current search to pass to interactive graph
+    videos_payload = []
+    if search_active and not df_total.empty:
+        for _, row in df_total.iterrows():
+            videos_payload.append({
+                "Title": str(row.get("Title", "")),
+                "Channel": str(row.get("Channel", "")),
+                "Subscribers": str(row.get("Subscribers", "")),
+                "Views": int(row.get("Views", 0)),
+                "Published": str(row.get("Published", "")),
+                "URL": str(row.get("URL", "")),
+                "Thumbnail": str(row.get("Thumbnail", "")),
+                "Multiplicador": float(row.get("Multiplicador", 0.0)),
+                "Keyword_Origen": str(row.get("Keyword_Origen", ""))
+            })
+
     with c_graph3:
         st.metric("Nodos", 0 if nodes_graph.empty else len(nodes_graph))
         st.metric("Conexiones", 0 if edges_graph.empty else len(edges_graph))
 
-    render_neural_graph(nodes_graph, edges_graph, height=720)
+    render_neural_graph(nodes_graph, edges_graph, videos_payload, height=720)
 
     with st.expander("Ver datos del mapa"):
         st.markdown("### Nodos mas fuertes")
