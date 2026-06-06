@@ -2001,7 +2001,7 @@ def crear_tabla_canales_validados(df_total):
     return tabla.drop(columns=["_orden"])
 
 
-def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords, max_recommended_sources):
+def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords, max_recommended_sources=4):
     st.session_state.outliers_data = []
     st.session_state.guiones_data = []
     st.session_state.nichos_similares = []
@@ -2212,7 +2212,8 @@ if buscar or random_click:
             max_ciclos,
             max_guiones,
             max_keywords_expansion,
-            profundidad_keywords
+            profundidad_keywords,
+            max_recommended_sources
         )
 
 if "keywords_generadas" in st.session_state and st.session_state.keywords_generadas:
