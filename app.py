@@ -1051,7 +1051,7 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
             
             const header = document.createElement("div");
             header.className = "panel-header";
-            header.innerText = "Videos: \"" + nodeLabel + "\"";
+            header.innerText = 'Videos: "' + nodeLabel + '"';
             panel.appendChild(header);
             
             const matches = videos.filter(v => {{
