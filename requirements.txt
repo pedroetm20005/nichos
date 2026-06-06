@@ -1,4 +1,3 @@
-txt
 streamlit
 requests
 pandas
@@ -6,4 +5,4 @@ numpy
 Pillow
 colorthief
 youtube-transcript-api
-
+psycopg2-binary
