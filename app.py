@@ -1061,7 +1061,7 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
             }},
             stabilization: {{
               enabled: true,
-              iterations: 150
+              iterations: 2000
             }}
           }},
           edges: {{
@@ -1076,6 +1076,10 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
         }};
         
         const network = new vis.Network(container, data, options);
+        
+        network.once("stabilized", function () {{
+            network.setOptions({{ physics: false }});
+        }});
         const panel = document.getElementById("details-panel");
         
         function formatNumber(num) {{
