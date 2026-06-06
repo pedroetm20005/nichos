@@ -225,55 +225,19 @@ def get_cached_graph_edges(limit_edges, min_edge_weight):
     try:
         return pd.read_sql_query("""
             SELECT
-                source_type,
-                source_value,
-                target_type,
-                target_value,
-                COUNT(*) AS uses,
-                SUM(weight) AS total_weight,
-                AVG(weight) AS avg_weight
-            FROM graph_edges
-            GROUP BY source_type, source_value, target_type, target_value
-            HAVING SUM(weight) >= %s
-            ORDER BY total_weight DESC, uses DESC
-            LIMIT %s
-        """, conn, params=(min_edge_weight, limit_edges))
+                g.source_type,
+                g.source_value,
+                g.target_type,
+                g.target_value,
+                g.weight,
+                a.seeds
+            FROM graph_edges g
+            JOIN analyses a ON g.analysis_id = a.id
+            ORDER BY g.id DESC
+        """, conn)
     finally:
         conn.close()
 
-GLOBAL_MEMORY_CACHE = {}
-GLOBAL_CACHE_LOADED = False
-
-def load_global_cache_if_needed():
-    global GLOBAL_CACHE_LOADED, GLOBAL_MEMORY_CACHE
-    if GLOBAL_CACHE_LOADED:
-        return
-    try:
-        import psycopg2
-        import streamlit as st
-        creds = st.secrets["postgres"]
-        conn = psycopg2.connect(
-            host=creds["host"],
-            database=creds["database"],
-            user=creds["user"],
-            password=creds["password"],
-            port=creds.get("port", 5432)
-        )
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT cache_key, payload, created_at FROM request_cache")
-                    rows = cur.fetchall()
-                    for row in rows:
-                        try:
-                            GLOBAL_MEMORY_CACHE[row[0]] = (json.loads(row[1]), float(row[2] or 0))
-                        except Exception:
-                            pass
-        finally:
-            conn.close()
-        GLOBAL_CACHE_LOADED = True
-    except Exception:
-        pass
 
 class PatternMemory:
     def __init__(self):
@@ -582,9 +546,9 @@ class PatternMemory:
         consolidated_edges = {}
         node_weights = Counter()
         node_types = {}
+        niche_edges = set()
 
         for _, row in edges_raw.iterrows():
-            # Filter out recency type nodes from mind map
             if row["source_type"] == "recency" or row["target_type"] == "recency":
                 continue
 
@@ -592,15 +556,14 @@ class PatternMemory:
             tgt_val = clean_and_singularize_label(row["target_value"])
             src_type = row["source_type"]
             tgt_type = row["target_type"]
-            weight = float(row["total_weight"])
-            uses = int(row["uses"])
+            weight = float(row["weight"])
+            seeds_str = str(row["seeds"])
 
             if not src_val or not tgt_val or src_val == tgt_val:
                 continue
 
-            # Consolidated undirected edges (alphabetical sorting to avoid bidirectional duplicate paths)
+            # Consolidated undirected edges between patterns
             edge_key = tuple(sorted([src_val, tgt_val]))
-            
             if edge_key not in consolidated_edges:
                 consolidated_edges[edge_key] = {
                     "from": edge_key[0],
@@ -609,19 +572,58 @@ class PatternMemory:
                     "total_weight": 0.0,
                     "count": 0
                 }
-            
-            consolidated_edges[edge_key]["uses"] += uses
+            consolidated_edges[edge_key]["uses"] += 1
             consolidated_edges[edge_key]["total_weight"] += weight
             consolidated_edges[edge_key]["count"] += 1
 
             node_weights[src_val] += weight
             node_weights[tgt_val] += weight
 
-            # Retain the most descriptive type (prioritizing non-generic types)
             if src_val not in node_types or src_type != "title_token":
                 node_types[src_val] = src_type
             if tgt_val not in node_types or tgt_type != "title_token":
                 node_types[tgt_val] = tgt_type
+
+            # Connect seeds (niche node) to source and target patterns of this analysis
+            niche_list = [s.strip().lower() for s in seeds_str.split(",") if s.strip()]
+            if niche_list:
+                niche_name = niche_list[0]
+                niche_clean = clean_and_singularize_label(niche_name)
+                
+                node_types[niche_clean] = "nicho"
+                node_weights[niche_clean] += weight * 0.1
+                
+                niche_edge_key_1 = tuple(sorted([niche_clean, src_val]))
+                if niche_edge_key_1[0] != niche_edge_key_1[1] and niche_edge_key_1 not in niche_edges:
+                    niche_edges.add(niche_edge_key_1)
+                    if niche_edge_key_1 not in consolidated_edges:
+                        consolidated_edges[niche_edge_key_1] = {
+                            "from": niche_edge_key_1[0],
+                            "to": niche_edge_key_1[1],
+                            "uses": 1,
+                            "total_weight": weight * 1.5,
+                            "count": 1
+                        }
+                    else:
+                        consolidated_edges[niche_edge_key_1]["uses"] += 1
+                        consolidated_edges[niche_edge_key_1]["total_weight"] += weight * 1.5
+                        consolidated_edges[niche_edge_key_1]["count"] += 1
+
+                niche_edge_key_2 = tuple(sorted([niche_clean, tgt_val]))
+                if niche_edge_key_2[0] != niche_edge_key_2[1] and niche_edge_key_2 not in niche_edges:
+                    niche_edges.add(niche_edge_key_2)
+                    if niche_edge_key_2 not in consolidated_edges:
+                        consolidated_edges[niche_edge_key_2] = {
+                            "from": niche_edge_key_2[0],
+                            "to": niche_edge_key_2[1],
+                            "uses": 1,
+                            "total_weight": weight * 1.5,
+                            "count": 1
+                        }
+                    else:
+                        consolidated_edges[niche_edge_key_2]["uses"] += 1
+                        consolidated_edges[niche_edge_key_2]["total_weight"] += weight * 1.5
+                        consolidated_edges[niche_edge_key_2]["count"] += 1
 
         if not consolidated_edges:
             return pd.DataFrame(), pd.DataFrame()
@@ -637,11 +639,13 @@ class PatternMemory:
             })
         edges_df = pd.DataFrame(edges_list)
 
+        edges_df = edges_df.sort_values("total_weight", ascending=False).head(limit_edges)
+
         nodes_list = []
         for node_id, weight in node_weights.items():
             nodes_list.append({
                 "id": node_id,
-                "label": node_id,
+                "label": node_id.upper() if node_types.get(node_id) == "nicho" else node_id,
                 "type": node_types.get(node_id, "unknown"),
                 "weight": weight
             })
@@ -780,6 +784,10 @@ memoria = PatternMemory()
 
 
 def neural_node_color(node_type):
+    if "nicho" in node_type:
+        return "#f59e0b" # Gold/Amber for Niche
+    if "transcript" in node_type:
+        return "#ec4899" # Pink for Transcript Concepts (Themes)
     if "title_token" in node_type:
         return "#3f7df4"
     if "title_bigram" in node_type:
@@ -795,19 +803,6 @@ def neural_node_color(node_type):
     if "color" in node_type:
         return "#22c55e"
     return "#94a3b8"
-
-
-def clean_and_singularize_label(label):
-    label = str(label).lower().strip()
-    label = re.sub(r"[^\w\s]", " ", label)
-    label = re.sub(r"\s+", " ", label)
-    words = label.split()
-    clean_words = []
-    for w in words:
-        if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
-            w = w[:-1]
-        clean_words.append(w)
-    return " ".join(clean_words).strip()
 
 
 def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
@@ -2640,7 +2635,7 @@ if "keywords_generadas" in st.session_state and st.session_state.keywords_genera
         st.text_area("Keywords encontradas:", value=", ".join(st.session_state.keywords_generadas), height=180)
 
 # Helper to extract graph in-memory for current search
-def extract_current_search_graph(seeds, df_total, ideas, final_score):
+def extract_current_search_graph(seeds, df_total, ideas, guiones_data, final_score):
     if df_total is None or df_total.empty:
         return pd.DataFrame(), pd.DataFrame()
     
@@ -2664,16 +2659,44 @@ def extract_current_search_graph(seeds, df_total, ideas, final_score):
                 graph_patterns[val] += final_score / 100
                 pattern_types[val] = "idea_" + pattern_type
 
+    # Add transcript/script concepts (what is spoken in the videos)
+    if guiones_data:
+        for guion in guiones_data:
+            conceptos = guion.get("Conceptos", [])
+            for palabra, count in conceptos:
+                val = clean_and_singularize_label(palabra)
+                if val:
+                    graph_patterns[val] += count * 0.15
+                    pattern_types[val] = "transcript_concept"
+
     edges_payload = []
     top_patterns = graph_patterns.most_common(35)
     
+    # Niche node
+    niche_name = seeds[0] if isinstance(seeds, list) and seeds else str(seeds)
+    niche_node_id = clean_and_singularize_label(niche_name)
+    
+    # 1. Connect niche to all top patterns (creating branches from the niche)
+    for pattern_val, weight in top_patterns:
+        if pattern_val == niche_node_id:
+            continue
+        from_node, to_node = sorted([niche_node_id, pattern_val])
+        edges_payload.append({
+            "from": from_node,
+            "to": to_node,
+            "uses": 1,
+            "total_weight": weight * 1.5,
+            "avg_weight": weight * 1.5
+        })
+
+    # 2. Connect patterns between themselves
     for i in range(len(top_patterns)):
         source_val, source_weight = top_patterns[i]
 
         for j in range(i + 1, min(i + 12, len(top_patterns))):
             target_val, target_weight = top_patterns[j]
 
-            if source_val == target_val:
+            if source_val == target_val or source_val == niche_node_id or target_val == niche_node_id:
                 continue
 
             edge_weight = float(min(source_weight, target_weight))
@@ -2686,8 +2709,17 @@ def extract_current_search_graph(seeds, df_total, ideas, final_score):
                 "avg_weight": edge_weight
             })
 
-    nodes_payload = []
+    # Add niche node explicitly
+    nodes_payload = [{
+        "id": niche_node_id,
+        "label": niche_name.upper(),
+        "type": "nicho",
+        "weight": 5.0
+    }]
+    
     for node_val, weight in graph_patterns.items():
+        if node_val == niche_node_id:
+            continue
         nodes_payload.append({
             "id": node_val,
             "label": node_val,
@@ -3004,6 +3036,7 @@ with tab_mapa:
             semillas_para_autoguardado,
             df_total,
             ideas,
+            st.session_state.get("guiones_data", []),
             score_memoria_auto
         )
         
