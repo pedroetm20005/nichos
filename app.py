@@ -1081,14 +1081,14 @@ def render_neural_graph(nodes_df, edges_df, videos_list=None, height=720):
                 const badgeClass = getBadgeClass(v.Multiplicador);
                 
                 item.innerHTML = `
-                    <img class="video-thumb" src="${v.Thumbnail}" alt="">
+                    <img class="video-thumb" src="${{v.Thumbnail}}" alt="">
                     <div class="video-info" style="flex: 1; min-width: 0;">
-                        <div class="video-title">${v.Title}</div>
+                        <div class="video-title">${{v.Title}}</div>
                         <div style="display: flex; align-items: center; margin-bottom: 2px;">
-                            <span class="video-badge ${badgeClass}">${v.Multiplicador.toFixed(1)}x</span>
-                            <span class="video-meta" style="flex: 1;">${v.Channel}</span>
+                            <span class="video-badge ${{badgeClass}}">${{v.Multiplicador.toFixed(1)}}x</span>
+                            <span class="video-meta" style="flex: 1;">${{v.Channel}}</span>
                         </div>
-                        <div class="video-meta">${formatNumber(v.Views)} vistas - ${v.Published}</div>
+                        <div class="video-meta">${{formatNumber(v.Views)}} vistas - ${{v.Published}}</div>
                     </div>
                 `;
                 panel.appendChild(item);
