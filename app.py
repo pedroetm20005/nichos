@@ -160,8 +160,58 @@ class PatternMemory:
                             created_at TEXT
                         );
                     """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS request_cache (
+                            cache_key TEXT PRIMARY KEY,
+                            payload TEXT,
+                            created_at DOUBLE PRECISION
+                        );
+                    """)
         finally:
             conn.close()
+
+    def cache_get(self, cache_key, ttl_seconds=None):
+        # ESTO SIRVE PARA NO PEDIR A YOUTUBE LO MISMO UNA Y OTRA VEZ.
+        try:
+            conn = self.get_conn()
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT payload, created_at FROM request_cache WHERE cache_key = %s",
+                            (cache_key,)
+                        )
+                        row = cur.fetchone()
+            finally:
+                conn.close()
+
+            if not row:
+                return None
+
+            payload, created_at = row
+            if ttl_seconds is not None and time.time() - float(created_at or 0) > ttl_seconds:
+                return None
+
+            return json.loads(payload)
+        except Exception:
+            return None
+
+    def cache_set(self, cache_key, payload):
+        try:
+            conn = self.get_conn()
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO request_cache (cache_key, payload, created_at)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (cache_key)
+                            DO UPDATE SET payload = EXCLUDED.payload, created_at = EXCLUDED.created_at
+                        """, (cache_key, json.dumps(payload), time.time()))
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
         if df_total is None or df_total.empty:
@@ -935,7 +985,8 @@ def render_outlier_cards(df_total):
 # =========================================================
 
 class YouTubeHyperMiner:
-    def __init__(self):
+    def __init__(self, memory=None):
+        self.memory = memory
         self.subs_cache = {}
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -943,6 +994,11 @@ class YouTubeHyperMiner:
         }
 
     def get_youtube_suggestions(self, keyword):
+        cache_key = f"suggestions:v1:{keyword.lower().strip()}"
+        cached = self._cache_get(cache_key, ttl_seconds=7 * 24 * 3600)
+        if cached is not None:
+            return cached
+
         url = f"https://suggestqueries.google.com/complete/search?client=youtube&hl=en&ds=yt&q={quote(keyword)}"
         try:
             response = requests.get(url, headers=self.headers, timeout=7)
@@ -951,12 +1007,19 @@ class YouTubeHyperMiner:
                 if "(" in clean_text:
                     clean_text = clean_text[clean_text.find("(")+1:clean_text.rfind(")")]
                 data = json.loads(clean_text)
-                return [item[0] for item in data[1] if item[0].lower() != keyword.lower()]
+                suggestions = [item[0] for item in data[1] if item[0].lower() != keyword.lower()]
+                self._cache_set(cache_key, suggestions)
+                return suggestions
         except Exception:
             pass
         return []
 
     def scrape_keyword_videos(self, keyword):
+        cache_key = f"search:v2:{keyword.lower().strip()}"
+        cached = self._cache_get(cache_key, ttl_seconds=24 * 3600)
+        if cached is not None:
+            return cached
+
         search_url = f"https://www.youtube.com/results?search_query={quote(keyword)}&sp=CAI%253D"
         videos = []
 
@@ -1018,9 +1081,75 @@ class YouTubeHyperMiner:
         except Exception:
             pass
 
+        if videos:
+            self._cache_set(cache_key, videos)
+
         return videos
 
+    def scrape_recommended_videos(self, video_id, source_title="", limit=12):
+        # ESTO SIRVE PARA MIRAR EL FEED RECOMENDADO DE UN VIDEO OUTLIER.
+        # ES UNA SENAL MUY BUENA PORQUE YOUTUBE RELACIONA ESOS VIDEOS CON EL NICHO.
+        if not video_id:
+            return []
+
+        cache_key = f"recommended:v2:{video_id}"
+        cached = self._cache_get(cache_key, ttl_seconds=24 * 3600)
+        if cached is not None:
+            return cached[:limit]
+
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            response = requests.get(url, headers=self.headers, timeout=12)
+
+            if response.status_code != 200:
+                return []
+
+            yt_data = self._extract_yt_initial_data(response.text)
+            if not yt_data:
+                return []
+
+            recommended = []
+            seen = set()
+
+            for renderer in self._find_renderers(yt_data, "compactVideoRenderer"):
+                rec_id = renderer.get("videoId", "")
+
+                if not rec_id or rec_id == video_id or rec_id in seen:
+                    continue
+
+                seen.add(rec_id)
+                title = self._text_from_runs(renderer.get("title", {}))
+                channel = self._text_from_runs(renderer.get("shortBylineText", {})) or self._text_from_runs(renderer.get("longBylineText", {}))
+                views_text = self._text_from_runs(renderer.get("viewCountText", {}))
+                published = self._text_from_runs(renderer.get("publishedTimeText", {})) or "Unknown"
+
+                recommended.append({
+                    "Title": title or "Sin titulo",
+                    "Channel": channel or "Canal",
+                    "Views": self._parse_views(views_text),
+                    "Published": published,
+                    "URL": f"https://www.youtube.com/watch?v={rec_id}",
+                    "ID": rec_id,
+                    "Thumbnail": f"https://img.youtube.com/vi/{rec_id}/hqdefault.jpg",
+                    "Source_Video_ID": video_id,
+                    "Source_Title": source_title,
+                    "Signal": "Feed recomendado"
+                })
+
+                if len(recommended) >= limit:
+                    break
+
+            self._cache_set(cache_key, recommended)
+            return recommended
+        except Exception:
+            return []
+
     def extract_script_keywords(self, video_id):
+        cache_key = f"transcript:v1:{video_id}"
+        cached = self._cache_get(cache_key, ttl_seconds=14 * 24 * 3600)
+        if cached is not None:
+            return cached
+
         try:
             transcript = None
 
@@ -1058,6 +1187,7 @@ class YouTubeHyperMiner:
             full_text = " ".join(textos).lower()
             full_text = re.sub(r'[^\w\s]', ' ', full_text)
             full_text = re.sub(r'\s+', ' ', full_text).strip()
+            self._cache_set(cache_key, full_text)
             return full_text
 
         except Exception:
@@ -1069,6 +1199,12 @@ class YouTubeHyperMiner:
 
         if video_id in self.subs_cache:
             return self.subs_cache[video_id]
+
+        cache_key = f"subs:v1:{video_id}"
+        cached = self._cache_get(cache_key, ttl_seconds=7 * 24 * 3600)
+        if cached is not None:
+            self.subs_cache[video_id] = cached
+            return cached
 
         try:
             url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1092,14 +1228,56 @@ class YouTubeHyperMiner:
                 if match:
                     subs = match.group(1)
                     self.subs_cache[video_id] = subs
+                    self._cache_set(cache_key, subs)
                     return subs
 
             self.subs_cache[video_id] = "Hidden/Unknown"
+            self._cache_set(cache_key, "Hidden/Unknown")
             return "Hidden/Unknown"
 
         except Exception:
             self.subs_cache[video_id] = "Unknown"
             return "Unknown"
+
+    def _cache_get(self, cache_key, ttl_seconds=None):
+        if not self.memory:
+            return None
+        return self.memory.cache_get(cache_key, ttl_seconds=ttl_seconds)
+
+    def _cache_set(self, cache_key, payload):
+        if self.memory:
+            self.memory.cache_set(cache_key, payload)
+
+    def _extract_yt_initial_data(self, html_text):
+        match = re.search(r'var ytInitialData = ({.*?});</script>', html_text, re.DOTALL)
+        if not match:
+            match = re.search(r'ytInitialData"\]\s*=\s*({.*?});', html_text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            return None
+
+    def _find_renderers(self, data, renderer_name):
+        if isinstance(data, dict):
+            if renderer_name in data and isinstance(data[renderer_name], dict):
+                yield data[renderer_name]
+            for value in data.values():
+                yield from self._find_renderers(value, renderer_name)
+        elif isinstance(data, list):
+            for item in data:
+                yield from self._find_renderers(item, renderer_name)
+
+    def _text_from_runs(self, obj):
+        if not isinstance(obj, dict):
+            return ""
+        if "simpleText" in obj:
+            return str(obj.get("simpleText", ""))
+        runs = obj.get("runs", [])
+        if isinstance(runs, list):
+            return "".join([str(run.get("text", "")) for run in runs if isinstance(run, dict)]).strip()
+        return ""
 
     def _parse_views(self, text):
         clean = re.sub(r'[^\d\.KMBkmb]', '', str(text))
@@ -1823,17 +2001,19 @@ def crear_tabla_canales_validados(df_total):
     return tabla.drop(columns=["_orden"])
 
 
-def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords):
+def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_expansion, profundidad_keywords, max_recommended_sources):
     st.session_state.outliers_data = []
     st.session_state.guiones_data = []
     st.session_state.nichos_similares = []
     st.session_state.keywords_generadas = []
+    st.session_state.recommended_data = []
 
     historico_outliers = []
     keywords_procesadas = set()
     guiones_acumulados = []
+    recomendados_acumulados = []
 
-    miner = YouTubeHyperMiner()
+    miner = YouTubeHyperMiner(memoria)
     semillas_iniciales = [k.strip().lower() for k in input_raw.split(",") if k.strip()]
     st.session_state.semillas_iniciales = semillas_iniciales
 
@@ -1893,6 +2073,26 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
 
         top_videos = df_ordenado.head(max_guiones).to_dict(orient="records")
 
+        top_recommended_sources = (
+            df_ordenado[df_ordenado["Multiplicador"] >= 3.0]
+            .head(max_recommended_sources)
+            .to_dict(orient="records")
+        )
+
+        if top_recommended_sources:
+            for index, row in enumerate(top_recommended_sources):
+                status_box.text(f" [{index + 1}/{len(top_recommended_sources)}] Leyendo feed recomendado de: {row['Title'][:60]}...")
+                recomendados = miner.scrape_recommended_videos(
+                    row.get("ID", ""),
+                    source_title=row.get("Title", ""),
+                    limit=12
+                )
+
+                for rec in recomendados:
+                    rec["Keyword_Origen"] = f"feed de {row.get('Keyword_Origen', '')}"
+                    rec["Source_Multiplicador"] = row.get("Multiplicador", 0)
+                    recomendados_acumulados.append(rec)
+
         for index, row in enumerate(top_videos):
             status_box.text(f" [{index + 1}/{len(top_videos)}] Extrayendo guion de: {row['Title'][:60]}...")
             texto_guion = miner.extract_script_keywords(row["ID"])
@@ -1914,6 +2114,14 @@ def run_mining(input_raw, outlier_factor, max_ciclos, max_guiones, max_keywords_
     st.session_state.outliers_data = historico_outliers
     st.session_state.guiones_data = guiones_acumulados
     st.session_state.nichos_similares = nichos_similares
+    if recomendados_acumulados:
+        st.session_state.recommended_data = (
+            pd.DataFrame(recomendados_acumulados)
+            .drop_duplicates(subset=["URL"])
+            .to_dict(orient="records")
+        )
+    else:
+        st.session_state.recommended_data = []
 
 
 # =========================================================
@@ -1937,11 +2145,9 @@ max_ciclos = st.sidebar.slider("Ramas totales", 2, MAX_SAFE_BRANCHES, 40)
 max_keywords_expansion = st.sidebar.slider("Keywords reales maximas", 50, MAX_SAFE_KEYWORDS, 120)
 profundidad_keywords = st.sidebar.slider("Profundidad de red", 1, MAX_SAFE_DEPTH, 2)
 max_guiones = st.sidebar.slider("Videos buenos para guion", 1, 10, 5)
+max_recommended_sources = st.sidebar.slider("Videos fuente para feed recomendado", 0, 8, 4)
 
-st.sidebar.markdown("### MEMORIA")
-guardar_en_memoria = st.sidebar.checkbox("Guardar analisis en memoria IA", value=False, help="Si la app es publica, activa esto solo si quieres guardar este analisis en la memoria compartida de la app.")
-ver_memoria = st.sidebar.checkbox("Ver memoria aprendida", value=False)
-st.sidebar.caption("Auto-memoria activa: cada busqueda guarda patrones anonimos una vez.")
+
 
 st.markdown("""
 <div class="top-banner">
@@ -2358,28 +2564,9 @@ with tab_memoria:
             for p in prediccion_memoria["winning_patterns"]:
                 st.write(f'- {format_pattern(p)} | peso {p["avg_weight"]:.2f} | usos {p["uses"]}')
 
-    if guardar_en_memoria:
-        if st.button("Guardar resultado en memoria IA"):
-            score_final_mem, lectura_final_mem, _ = resumen_validacion_final(tabla_referencias, tabla_validacion)
+    st.markdown("### Ultimos analisis guardados")
+    st.dataframe(memoria.recent_analyses(10), use_container_width=True)
 
-            analysis_id = memoria.save_analysis(
-                semillas_para_memoria,
-                df_total,
-                score_final_mem,
-                score_auto,
-                lectura_final_mem,
-                color_patron,
-                ideas,
-                notes="Guardado desde Streamlit"
-            )
-
-            st.success(f"Analisis guardado en memoria IA con ID {analysis_id}")
-
-    if ver_memoria:
-        st.markdown("### Ultimos analisis guardados")
-        st.dataframe(memoria.recent_analyses(10), use_container_width=True)
-
-        st.markdown("### Patrones ganadores historicos")
-        st.dataframe(memoria.leaderboard(30), use_container_width=True)
-
+    st.markdown("### Patrones ganadores historicos")
+    st.dataframe(memoria.leaderboard(30), use_container_width=True)
 
