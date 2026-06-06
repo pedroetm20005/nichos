@@ -241,9 +241,36 @@ def get_cached_graph_edges(limit_edges, min_edge_weight):
     finally:
         conn.close()
 
+GLOBAL_MEMORY_CACHE = {}
+GLOBAL_CACHE_LOADED = False
+
+def load_global_cache_if_needed():
+    global GLOBAL_CACHE_LOADED, GLOBAL_MEMORY_CACHE
+    if GLOBAL_CACHE_LOADED:
+        return
+    try:
+        mem = PatternMemory()
+        conn = mem.get_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT cache_key, payload, created_at FROM request_cache")
+                    rows = cur.fetchall()
+                    for row in rows:
+                        try:
+                            GLOBAL_MEMORY_CACHE[row[0]] = (json.loads(row[1]), float(row[2] or 0))
+                        except Exception:
+                            pass
+        finally:
+            conn.close()
+        GLOBAL_CACHE_LOADED = True
+    except Exception:
+        pass
+
 class PatternMemory:
     def __init__(self):
         _initialize_postgresql_database()
+        load_global_cache_if_needed()
 
     def get_conn(self):
         import psycopg2
@@ -274,7 +301,15 @@ class PatternMemory:
         pass
 
     def cache_get(self, cache_key, ttl_seconds=None):
-        # ESTO SIRVE PARA NO PEDIR A YOUTUBE LO MISMO UNA Y OTRA VEZ.
+        # 1. Check global in-memory cache first
+        if cache_key in GLOBAL_MEMORY_CACHE:
+            payload, created_at = GLOBAL_MEMORY_CACHE[cache_key]
+            if ttl_seconds is not None and time.time() - float(created_at or 0) > ttl_seconds:
+                del GLOBAL_MEMORY_CACHE[cache_key]
+            else:
+                return payload
+
+        # 2. Fallback to PostgreSQL request_cache
         try:
             conn = self.get_conn()
             try:
@@ -291,37 +326,42 @@ class PatternMemory:
             if not row:
                 return None
 
-            payload, created_at = row
+            payload_str, created_at = row
+            payload = json.loads(payload_str)
+            GLOBAL_MEMORY_CACHE[cache_key] = (payload, created_at)
+
             if ttl_seconds is not None and time.time() - float(created_at or 0) > ttl_seconds:
                 return None
 
-            return json.loads(payload)
+            return payload
         except Exception:
             return None
 
     def cache_set(self, cache_key, payload):
-        try:
-            conn = self.get_conn()
+        now_ts = time.time()
+        GLOBAL_MEMORY_CACHE[cache_key] = (payload, now_ts)
+
+        # Write to PostgreSQL request_cache in background
+        def write_db_cache():
             try:
-                with conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO request_cache (cache_key, payload, created_at)
-                            VALUES (%s, %s, %s)
-                            ON CONFLICT (cache_key)
-                            DO UPDATE SET payload = EXCLUDED.payload, created_at = EXCLUDED.created_at
-                        """, (cache_key, json.dumps(payload), time.time()))
-            finally:
-                conn.close()
-        except Exception:
-            pass
+                conn = self.get_conn()
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO request_cache (cache_key, payload, created_at)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (cache_key)
+                                DO UPDATE SET payload = EXCLUDED.payload, created_at = EXCLUDED.created_at
+                            """, (cache_key, json.dumps(payload), now_ts))
+                finally:
+                    conn.close()
+            except Exception:
+                pass
 
-    def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
-        if df_total is None or df_total.empty:
-            return None
-
-        now = datetime.utcnow().isoformat(timespec="seconds")
-        seeds_text = ", ".join(seeds) if isinstance(seeds, list) else str(seeds)
+        import threading
+        t = threading.Thread(target=write_db_cache, daemon=True)
+        t.start()
 
     def save_analysis(self, seeds, df_total, final_score, auto_score, reading, color_rgb, ideas=None, notes=""):
         if df_total is None or df_total.empty:
@@ -352,29 +392,53 @@ class PatternMemory:
                     analysis_id = cur.fetchone()[0]
                     graph_patterns = Counter()
 
+                    # Collect pattern events for batch insert
+                    events_to_insert = []
+
                     for _, row_video in df_total.iterrows():
                         weight = self.video_weight(row_video)
                         for pattern_type, pattern_value in self.extract_video_patterns(row_video):
-                            cur.execute("""
-                                INSERT INTO pattern_events
-                                (analysis_id, pattern_type, pattern_value, weight, created_at)
-                                VALUES (%s, %s, %s, %s, %s)
-                            """, (analysis_id, pattern_type, pattern_value, weight, now))
+                            events_to_insert.append((
+                                analysis_id,
+                                pattern_type,
+                                pattern_value,
+                                weight,
+                                now
+                            ))
                             graph_patterns[(pattern_type, pattern_value)] += weight
 
                     for idea in ideas or []:
                         for pattern_type, pattern_value in self.extract_title_patterns(str(idea)):
-                            cur.execute("""
-                                INSERT INTO pattern_events
-                                (analysis_id, pattern_type, pattern_value, weight, created_at)
-                                VALUES (%s, %s, %s, %s, %s)
-                            """, (analysis_id, "idea_" + pattern_type, pattern_value, final_score / 100, now))
+                            events_to_insert.append((
+                                analysis_id,
+                                "idea_" + pattern_type,
+                                pattern_value,
+                                final_score / 100,
+                                now
+                            ))
                             graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
+
+                    if events_to_insert:
+                        import psycopg2.extras
+                        psycopg2.extras.execute_values(
+                            cur,
+                            """
+                            INSERT INTO pattern_events
+                            (analysis_id, pattern_type, pattern_value, weight, created_at)
+                            VALUES %s
+                            """,
+                            events_to_insert
+                        )
 
                     self._save_graph_edges_with_cursor(cur, analysis_id, graph_patterns, now)
 
-            # Clear the cache so the UI updates
-            st.cache_data.clear()
+            # Clear specific caches so the UI updates on next rerun
+            get_cached_analyses_count.clear()
+            get_cached_pattern_stats.clear()
+            get_cached_leaderboard.clear()
+            get_cached_recent_analyses.clear()
+            get_cached_graph_edges.clear()
+
             return analysis_id
         finally:
             conn.close()
@@ -384,6 +448,7 @@ class PatternMemory:
             return
 
         top_patterns = graph_patterns.most_common(35)
+        edges_to_insert = []
 
         for i in range(len(top_patterns)):
             (source_type, source_value), source_weight = top_patterns[i]
@@ -395,12 +460,7 @@ class PatternMemory:
                     continue
 
                 edge_weight = float(min(source_weight, target_weight))
-
-                cur.execute("""
-                    INSERT INTO graph_edges
-                    (analysis_id, source_type, source_value, target_type, target_value, weight, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (
+                edges_to_insert.append((
                     analysis_id,
                     source_type,
                     source_value,
@@ -409,6 +469,18 @@ class PatternMemory:
                     edge_weight,
                     created_at
                 ))
+
+        if edges_to_insert:
+            import psycopg2.extras
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO graph_edges
+                (analysis_id, source_type, source_value, target_type, target_value, weight, created_at)
+                VALUES %s
+                """,
+                edges_to_insert
+            )
 
     def predict_opportunity(self, seeds, df_total, color_rgb=None, ideas=None):
         history_count = get_cached_analyses_count()
@@ -618,11 +690,22 @@ class PatternMemory:
             "how", "why", "what", "when", "where", "who", "are", "was", "were",
             "into", "about", "video", "videos", "official", "full", "new", "best",
             "top", "review", "analysis", "explained", "breakdown", "para", "como",
-            "esta", "este", "pero", "porque", "todo", "algo", "nada"
+            "esta", "este", "pero", "porque", "todo", "algo", "nada", "youtube",
+            "channel", "channels", "subscribe", "subscribers", "views", "shorts",
+            "grow", "growth", "viral", "canal", "canales", "vistas", "suscribete",
+            "reproducciones", "como", "para", "todo", "todos", "toda", "todas"
         }
 
         clean = self.clean(text)
-        return [w for w in clean.split() if w not in stopwords and len(w) > 3]
+        tokens = []
+        for w in clean.split():
+            if w in stopwords or len(w) <= 3:
+                continue
+            if w.endswith("s") and not w.endswith("ss") and len(w) > 4:
+                w = w[:-1]
+            if w not in stopwords and len(w) > 3:
+                tokens.append(w)
+        return tokens
 
     def clean(self, text):
         text = str(text).lower()
@@ -1797,6 +1880,7 @@ def generar_nichos_similares(semillas_iniciales, historico_outliers, guiones_acu
     return nichos_limpios[:limite]
 
 
+@st.cache_data
 def analizar_patron_ganador(urls_miniaturas):
     colores_dominantes = []
 
@@ -2278,276 +2362,341 @@ if "keywords_generadas" in st.session_state and st.session_state.keywords_genera
         st.write(f"Total generadas: {len(st.session_state.keywords_generadas)}")
         st.text_area("Keywords encontradas:", value=", ".join(st.session_state.keywords_generadas), height=180)
 
-if not st.session_state.get("outliers_data"):
-    st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho. Los videos que salgan aqui seran outliers.")
-    st.stop()
+# Helper to extract graph in-memory for current search
+def extract_current_search_graph(seeds, df_total, ideas, final_score):
+    if df_total is None or df_total.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    graph_patterns = Counter()
 
-df_total = pd.DataFrame(st.session_state.outliers_data)
-df_total = df_total.drop_duplicates(subset=["URL"]).sort_values(by="Multiplicador", ascending=False)
+    for _, row in df_total.iterrows():
+        weight = memoria.video_weight(row)
+        for pattern_type, pattern_value in memoria.extract_video_patterns(row):
+            graph_patterns[(pattern_type, pattern_value)] += weight
 
-if "Subscribers" not in df_total.columns:
-    df_total["Subscribers"] = "Unknown"
+    for idea in ideas or []:
+        for pattern_type, pattern_value in memoria.extract_title_patterns(str(idea)):
+            graph_patterns[("idea_" + pattern_type, pattern_value)] += final_score / 100
 
-df_total["Subscribers"] = df_total["Subscribers"].fillna("Unknown")
+    edges_payload = []
+    top_patterns = graph_patterns.most_common(35)
+    
+    for i in range(len(top_patterns)):
+        (source_type, source_value), source_weight = top_patterns[i]
 
-df_total_sin_filtros = df_total.copy()
-df_total = filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_subs)
+        for j in range(i + 1, min(i + 12, len(top_patterns))):
+            (target_type, target_value), target_weight = top_patterns[j]
 
-if df_total.empty:
-    st.warning(
-        f"Hay {len(df_total_sin_filtros)} outliers encontrados, pero ninguno pasa los filtros actuales: "
-        f"{periodo_publicacion} - {rango_subs}. Abre el filtro de meses/subs para verlos."
-    )
-    st.stop()
+            if source_type == target_type and source_value == target_value:
+                continue
 
-score_auto, motivos_auto = calcular_score_oportunidad(df_total)
-tabla_referencias = crear_tabla_referencias(df_total)
-tabla_validacion = crear_tabla_validacion(df_total)
-tabla_canales = crear_tabla_canales_validados(df_total)
+            edge_weight = float(min(source_weight, target_weight))
+            edges_payload.append({
+                "source_type": source_type,
+                "source_value": source_value,
+                "target_type": target_type,
+                "target_value": target_value,
+                "uses": 1,
+                "total_weight": edge_weight,
+                "avg_weight": edge_weight
+            })
 
-ideas = generar_ideas_ataque(
-    df_total,
-    st.session_state.get("guiones_data", []),
-    st.session_state.get("nichos_similares", []),
-    limite=20
-)
+    nodes_payload = []
+    node_counter = Counter()
+    for (ptype, pval), weight in graph_patterns.items():
+        node_id = f"{ptype}::{pval}"
+        node_counter[node_id] += weight
 
-color_patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
-semillas_para_autoguardado = st.session_state.get(
-    "semillas_iniciales",
-    [k.strip().lower() for k in input_raw.split(",") if k.strip()]
-)
-score_memoria_auto, lectura_memoria_auto, _ = resumen_validacion_final(
-    tabla_referencias,
-    tabla_validacion
-)
-autosaved_id = autosave_analysis_once(
-    semillas_para_autoguardado,
-    df_total,
-    score_memoria_auto,
-    score_auto,
-    lectura_memoria_auto,
-    color_patron,
-    ideas
-)
+    for node_id, weight in node_counter.items():
+        node_type, node_value = node_id.split("::", 1)
+        nodes_payload.append({
+            "id": node_id,
+            "label": node_value,
+            "type": node_type,
+            "weight": weight
+        })
 
-if autosaved_id == "background":
-    st.toast("💾 Guardando análisis en la base de datos en segundo plano...", icon="☁️")
-elif autosaved_id:
-    st.success(f"Búsqueda guardada en memoria con ID {autosaved_id}.")
+    return pd.DataFrame(nodes_payload), pd.DataFrame(edges_payload)
 
-tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_mapa, tab_memoria = st.tabs([
+
+# Define tabs immediately
+tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_mapa = st.tabs([
     "Videos outliers",
     "Nicho",
     "Ideas validadas",
     "Canales validados",
-    "Mapa neural",
-    "Memoria IA"
+    "Mapa neural"
 ])
 
-with tab_outliers:
-    st.markdown('<div class="page-title">All outliers</div>', unsafe_allow_html=True)
-    render_outlier_cards(df_total)
+# Check if search is active
+search_active = False
+if st.session_state.get("outliers_data"):
+    df_total = pd.DataFrame(st.session_state.outliers_data)
+    df_total = df_total.drop_duplicates(subset=["URL"]).sort_values(by="Multiplicador", ascending=False)
 
-    with st.expander("Ver tabla completa de outliers"):
-        st.dataframe(
-            df_total[
-                [
-                    "Keyword_Origen",
-                    "Title",
-                    "Channel",
-                    "Subscribers",
-                    "Views",
-                    "Published",
-                    "Multiplicador",
-                    "URL"
-                ]
-            ],
-            use_container_width=True
+    if "Subscribers" not in df_total.columns:
+        df_total["Subscribers"] = "Unknown"
+    df_total["Subscribers"] = df_total["Subscribers"].fillna("Unknown")
+
+    df_total_sin_filtros = df_total.copy()
+    df_total = filtrar_outliers_por_sidebar(df_total, periodo_publicacion, rango_subs)
+
+    if not df_total.empty:
+        search_active = True
+        
+        # Calculate search metrics
+        score_auto, motivos_auto = calcular_score_oportunidad(df_total)
+        tabla_referencias = crear_tabla_referencias(df_total)
+        tabla_validacion = crear_tabla_validacion(df_total)
+        tabla_canales = crear_tabla_canales_validados(df_total)
+
+        ideas = generar_ideas_ataque(
+            df_total,
+            st.session_state.get("guiones_data", []),
+            st.session_state.get("nichos_similares", []),
+            limite=20
         )
+
+        color_patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+        semillas_para_autoguardado = st.session_state.get(
+            "semillas_iniciales",
+            [k.strip().lower() for k in input_raw.split(",") if k.strip()]
+        )
+        score_memoria_auto, lectura_memoria_auto, _ = resumen_validacion_final(
+            tabla_referencias,
+            tabla_validacion
+        )
+        autosaved_id = autosave_analysis_once(
+            semillas_para_autoguardado,
+            df_total,
+            score_memoria_auto,
+            score_auto,
+            lectura_memoria_auto,
+            color_patron,
+            ideas
+        )
+
+        if autosaved_id == "background":
+            st.toast("💾 Guardando análisis en la base de datos en segundo plano...", icon="☁️")
+        elif autosaved_id:
+            st.success(f"Búsqueda guardada en memoria con ID {autosaved_id}.")
+
+# Render tabs
+with tab_outliers:
+    if search_active:
+        st.markdown('<div class="page-title">All outliers</div>', unsafe_allow_html=True)
+        render_outlier_cards(df_total)
+
+        with st.expander("Ver tabla completa de outliers"):
+            st.dataframe(
+                df_total[
+                    [
+                        "Keyword_Origen",
+                        "Title",
+                        "Channel",
+                        "Subscribers",
+                        "Views",
+                        "Published",
+                        "Multiplicador",
+                        "URL"
+                    ]
+                ],
+                use_container_width=True
+            )
+    else:
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
 
 with tab_nicho:
-    st.markdown("## Validacion del nicho")
-    st.warning("Si ves Subs canal como Hidden/Unknown, puedes escribirlos a mano. Ejemplo: 25K, 80K, 1.2M.")
+    if search_active:
+        st.markdown("## Validacion del nicho")
+        st.warning("Si ves Subs canal como Hidden/Unknown, puedes escribirlos a mano. Ejemplo: 25K, 80K, 1.2M.")
 
-    st.markdown("### Tabla de ideas de los canales referencia")
+        st.markdown("### Tabla de ideas de los canales referencia")
 
-    tabla_referencias_editada = st.data_editor(
-        tabla_referencias,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Destaca?": st.column_config.SelectboxColumn("Destaca?", options=["Si", "No"], required=True),
-            "Link": st.column_config.LinkColumn("Link"),
-            "Subs canal": st.column_config.TextColumn("Subs canal"),
-            "Por que llama la atencion?": st.column_config.TextColumn("Por que llama la atencion?")
-        },
-        key="tabla_referencias_editor"
-    )
+        tabla_referencias_editada = st.data_editor(
+            tabla_referencias,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Destaca?": st.column_config.SelectboxColumn("Destaca?", options=["Si", "No"], required=True),
+                "Link": st.column_config.LinkColumn("Link"),
+                "Subs canal": st.column_config.TextColumn("Subs canal"),
+                "Por que llama la atencion?": st.column_config.TextColumn("Por que llama la atencion?")
+            },
+            key="tabla_referencias_editor"
+        )
 
-    st.markdown("### Tabla de validacion de ideas")
+        st.markdown("### Tabla de validacion de ideas")
 
-    tabla_validacion_editada = st.data_editor(
-        tabla_validacion,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Hay 3 videos ref.?": st.column_config.SelectboxColumn("Hay 3 videos ref.?", options=["Si", "No"], required=True),
-            "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["Alta", "Media", "Baja"], required=True),
-            "Alguno es de un canal pequeno?": st.column_config.CheckboxColumn("Alguno es de un canal pequeno?")
-        },
-        key="tabla_validacion_editor"
-    )
+        tabla_validacion_editada = st.data_editor(
+            tabla_validacion,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Hay 3 videos ref.?": st.column_config.SelectboxColumn("Hay 3 videos ref.?", options=["Si", "No"], required=True),
+                "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["Alta", "Media", "Baja"], required=True),
+                "Alguno es de un canal pequeno?": st.column_config.CheckboxColumn("Alguno es de un canal pequeno?")
+            },
+            key="tabla_validacion_editor"
+        )
 
-    score_final, lectura_final, motivos_finales = resumen_validacion_final(
-        tabla_referencias_editada,
-        tabla_validacion_editada
-    )
+        score_final, lectura_final, motivos_finales = resumen_validacion_final(
+            tabla_referencias_editada,
+            tabla_validacion_editada
+        )
 
-    col_score1, col_score2, col_score3 = st.columns(3)
-    col_score1.metric("Nota final del nicho", f"{score_final}/100")
-    col_score2.metric("Resultado", lectura_final)
-    col_score3.metric("Score automatico bruto", f"{score_auto}/100")
+        col_score1, col_score2, col_score3 = st.columns(3)
+        col_score1.metric("Nota final del nicho", f"{score_final}/100")
+        col_score2.metric("Resultado", lectura_final)
+        col_score3.metric("Score automatico bruto", f"{score_auto}/100")
 
-    st.markdown("**Motivos de la nota final:**")
-    for m in motivos_finales:
-        st.write(f"- {m}")
-
-    if motivos_auto:
-        st.markdown("**Senales automaticas extra:**")
-        for m in motivos_auto:
+        st.markdown("**Motivos de la nota final:**")
+        for m in motivos_finales:
             st.write(f"- {m}")
 
-    st.markdown("###  Nichos similares para seguir excavando")
+        if motivos_auto:
+            st.markdown("**Senales automaticas extra:**")
+            for m in motivos_auto:
+                st.write(f"- {m}")
 
-    if "nichos_similares" in st.session_state and st.session_state.nichos_similares:
-        st.text_area(
-            "Copia estos nichos/ramas para una nueva busqueda:",
-            value=", ".join(st.session_state.nichos_similares),
-            height=130
-        )
+        st.markdown("###  Nichos similares para seguir excavando")
 
-        cols_nichos = st.columns(3)
-        for i, nicho in enumerate(st.session_state.nichos_similares[:15]):
-            with cols_nichos[i % 3]:
-                st.code(nicho)
+        if "nichos_similares" in st.session_state and st.session_state.nichos_similares:
+            st.text_area(
+                "Copia estos nichos/ramas para una nueva busqueda:",
+                value=", ".join(st.session_state.nichos_similares),
+                height=130
+            )
+
+            cols_nichos = st.columns(3)
+            for i, nicho in enumerate(st.session_state.nichos_similares[:15]):
+                with cols_nichos[i % 3]:
+                    st.code(nicho)
+        else:
+            st.info("Aun no hay suficientes senales para sugerir nichos similares.")
+
+        st.markdown("### Direccion de miniatura")
+        st.write(f"Color dominante detectado: RGB {color_patron}")
+
+        for instruccion in generar_direccion_miniatura(df_total, color_patron):
+            st.write(f"- {instruccion}")
+
+        st.markdown("### Generador de base de miniatura basado en datos")
+
+        if st.button("Analizar miniaturas ganadoras y generar base"):
+            patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
+            st.write(f"Patron de color detectado: {patron}")
+            base_img = crear_base_miniatura(patron)
+            st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
     else:
-        st.info("Aun no hay suficientes senales para sugerir nichos similares.")
-
-    st.markdown("### Direccion de miniatura")
-    st.write(f"Color dominante detectado: RGB {color_patron}")
-
-    for instruccion in generar_direccion_miniatura(df_total, color_patron):
-        st.write(f"- {instruccion}")
-
-    st.markdown("### Generador de base de miniatura basado en datos")
-
-    if st.button("Analizar miniaturas ganadoras y generar base"):
-        patron = analizar_patron_ganador(df_total.head(12)["Thumbnail"].tolist())
-        st.write(f"Patron de color detectado: {patron}")
-        base_img = crear_base_miniatura(patron)
-        st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
 
 with tab_ideas:
-    st.markdown("## Ideas validadas")
+    if search_active:
+        st.markdown("## Ideas validadas")
 
-    st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=260)
+        st.text_area("Ideas listas para adaptar:", value="\n".join(ideas), height=260)
 
-    st.markdown("## Cajas de extraccion rapida")
+        st.markdown("## Cajas de extraccion rapida")
 
-    c1, c2 = st.columns(2)
-    semilla_referencia = df_total["Keyword_Origen"].iloc[0] if not df_total.empty else "video"
+        c1, c2 = st.columns(2)
+        semilla_referencia = df_total["Keyword_Origen"].iloc[0] if not df_total.empty else "video"
 
-    with c1:
-        st.markdown("### Basado en titulos ganadores")
+        with c1:
+            st.markdown("### Basado en titulos ganadores")
 
-        titulos_buenos = df_total["Title"].tolist()
-        stopwords_titulos = {
-            'the', 'is', 'and', 'to', 'in', 'of', 'a', 'for', 'with', 'on',
-            'how', 'video', 'but', 'why', 'what', 'when', 'from', 'this',
-            'that', 'you', 'your', 'about', 'into', 'after'
-        }
+            titulos_buenos = df_total["Title"].tolist()
+            stopwords_titulos = {
+                'the', 'is', 'and', 'to', 'in', 'of', 'a', 'for', 'with', 'on',
+                'how', 'video', 'but', 'why', 'what', 'when', 'from', 'this',
+                'that', 'you', 'your', 'about', 'into', 'after'
+            }
 
-        bigramas = []
-        for t in titulos_buenos:
-            clean_t = re.sub(r'[^\w\s]', '', t.lower())
-            palabras = [p for p in clean_t.split() if p not in stopwords_titulos and len(p) > 2]
+            bigramas = []
+            for t in titulos_buenos:
+                clean_t = re.sub(r'[^\w\s]', '', t.lower())
+                palabras = [p for p in clean_t.split() if p not in stopwords_titulos and len(p) > 2]
 
-            for i in range(len(palabras) - 1):
-                bigramas.append(f"{palabras[i]} {palabras[i + 1]}")
+                for i in range(len(palabras) - 1):
+                    bigramas.append(f"{palabras[i]} {palabras[i + 1]}")
 
-        top_bi = Counter(bigramas).most_common(8)
-        sug_titulos_caja = [f"{semilla_referencia} {token}" for token, _ in top_bi]
-
-        st.text_area(
-            "Patrones de titulos",
-            value=", ".join(list(dict.fromkeys(sug_titulos_caja))),
-            height=100,
-            label_visibility="collapsed"
-        )
-
-    with c2:
-        st.markdown("### Basado en lo hablado en guiones")
-
-        if "guiones_data" in st.session_state and st.session_state.guiones_data:
-            texto_global = " ".join([g["Texto"] for g in st.session_state.guiones_data])
-            conceptos_guion = extraer_conceptos_de_texto(texto_global, limite=10)
-            sug_guion_caja = [f"{semilla_referencia} {palabra}" for palabra, _ in conceptos_guion]
+            top_bi = Counter(bigramas).most_common(8)
+            sug_titulos_caja = [f"{semilla_referencia} {token}" for token, _ in top_bi]
 
             st.text_area(
-                "Palabras clave del guion",
-                value=", ".join(list(dict.fromkeys(sug_guion_caja))),
+                "Patrones de titulos",
+                value=", ".join(list(dict.fromkeys(sug_titulos_caja))),
                 height=100,
                 label_visibility="collapsed"
             )
-        else:
-            st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
 
-    st.markdown("## Radar de transcripciones")
+        with c2:
+            st.markdown("### Basado en lo hablado en guiones")
 
-    if "guiones_data" in st.session_state and st.session_state.guiones_data:
-        for i, guion in enumerate(st.session_state.guiones_data, start=1):
-            with st.expander(f"{i}. {guion['Title']}"):
-                st.markdown(f"**Canal:** {guion['Channel']}")
-                st.markdown(f"**Keyword origen:** {guion['Keyword_Origen']}")
-                st.markdown(f"[Abrir video]({guion['URL']})")
-
-                conceptos = guion["Conceptos"]
-
-                if conceptos:
-                    st.markdown("**Conceptos fuertes detectados:**")
-                    st.write(", ".join([f"{palabra} ({count})" for palabra, count in conceptos]))
-
-                    keyword_base_guion = guion["Keyword_Origen"]
-                    nuevas_busquedas = [f"{keyword_base_guion} {palabra}" for palabra, _ in conceptos[:8]]
-
-                    st.text_area(
-                        "Nuevas busquedas sugeridas desde esta transcripcion:",
-                        value=", ".join(nuevas_busquedas),
-                        height=80,
-                        key=f"ideas_guion_{i}"
-                    )
+            if "guiones_data" in st.session_state and st.session_state.guiones_data:
+                texto_global = " ".join([g["Texto"] for g in st.session_state.guiones_data])
+                conceptos_guion = extraer_conceptos_de_texto(texto_global, limite=10)
+                sug_guion_caja = [f"{semilla_referencia} {palabra}" for palabra, _ in conceptos_guion]
 
                 st.text_area(
-                    "Fragmento de transcripcion:",
-                    value=guion["Texto"][:2500],
-                    height=180,
-                    key=f"preview_guion_{i}"
+                    "Palabras clave del guion",
+                    value=", ".join(list(dict.fromkeys(sug_guion_caja))),
+                    height=100,
+                    label_visibility="collapsed"
                 )
+            else:
+                st.info("No hay suficientes transcripciones procesadas aun en esta tanda.")
+
+        st.markdown("## Radar de transcripciones")
+
+        if "guiones_data" in st.session_state and st.session_state.guiones_data:
+            for i, guion in enumerate(st.session_state.guiones_data, start=1):
+                with st.expander(f"{i}. {guion['Title']}"):
+                    st.markdown(f"**Canal:** {guion['Channel']}")
+                    st.markdown(f"**Keyword origen:** {guion['Keyword_Origen']}")
+                    st.markdown(f"[Abrir video]({guion['URL']})")
+
+                    conceptos = guion["Conceptos"]
+
+                    if conceptos:
+                        st.markdown("**Conceptos fuertes detectados:**")
+                        st.write(", ".join([f"{palabra} ({count})" for palabra, count in conceptos]))
+
+                        keyword_base_guion = guion["Keyword_Origen"]
+                        nuevas_busquedas = [f"{keyword_base_guion} {palabra}" for palabra, _ in conceptos[:8]]
+
+                        st.text_area(
+                            "Nuevas busquedas sugeridas desde esta transcripcion:",
+                            value=", ".join(nuevas_busquedas),
+                            height=80,
+                            key=f"ideas_guion_{i}"
+                        )
+
+                    st.text_area(
+                        "Fragmento de transcripcion:",
+                        value=guion["Texto"][:2500],
+                        height=180,
+                        key=f"preview_guion_{i}"
+                    )
+        else:
+            st.info("No hay transcripciones disponibles en esta tanda.")
     else:
-        st.info("No hay transcripciones disponibles en esta tanda.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
 
 with tab_canales:
-    st.markdown("## Canales validados")
+    if search_active:
+        st.markdown("## Canales validados")
 
-    if tabla_canales.empty:
-        st.info("Aun no hay canales validados.")
+        if tabla_canales.empty:
+            st.info("Aun no hay canales validados.")
+        else:
+            st.dataframe(
+                tabla_canales,
+                use_container_width=True,
+                column_config={"Link": st.column_config.LinkColumn("Link")}
+            )
     else:
-        st.dataframe(
-            tabla_canales,
-            use_container_width=True,
-            column_config={"Link": st.column_config.LinkColumn("Link")}
-        )
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
 
 with tab_mapa:
     st.markdown("## Mapa neural de memoria IA")
@@ -2564,10 +2713,49 @@ with tab_mapa:
     with c_graph2:
         min_weight = st.slider("Peso minimo", 0.01, 1.0, 0.08, step=0.01)
 
-    nodes_graph, edges_graph = memoria.graph_data(
+    # Load database graph
+    nodes_db, edges_db = memoria.graph_data(
         limit_edges=graph_limit,
         min_edge_weight=min_weight
     )
+    
+    # Merge with current search in-memory if active
+    if search_active:
+        nodes_curr, edges_curr = extract_current_search_graph(
+            semillas_para_autoguardado,
+            df_total,
+            ideas,
+            score_memoria_auto
+        )
+        
+        if not nodes_curr.empty and not edges_curr.empty:
+            if nodes_db.empty:
+                nodes_graph = nodes_curr
+            else:
+                combined_nodes = pd.concat([nodes_db, nodes_curr])
+                nodes_graph = combined_nodes.groupby(["id", "label", "type"], as_index=False).sum()
+                
+            if edges_db.empty:
+                edges_graph = edges_curr
+            else:
+                edges_db["_key"] = edges_db["source_type"] + "::" + edges_db["source_value"] + "->" + edges_db["target_type"] + "::" + edges_db["target_value"]
+                edges_curr["_key"] = edges_curr["source_type"] + "::" + edges_curr["source_value"] + "->" + edges_curr["target_type"] + "::" + edges_curr["target_value"]
+                
+                combined_edges = pd.concat([edges_db, edges_curr])
+                grouped = combined_edges.groupby("_key").agg({
+                    "source_type": "first",
+                    "source_value": "first",
+                    "target_type": "first",
+                    "target_value": "first",
+                    "uses": "sum",
+                    "total_weight": "sum",
+                    "avg_weight": "mean"
+                }).reset_index()
+                edges_graph = grouped.drop(columns=["_key"])
+        else:
+            nodes_graph, edges_graph = nodes_db, edges_db
+    else:
+        nodes_graph, edges_graph = nodes_db, edges_db
 
     with c_graph3:
         st.metric("Nodos", 0 if nodes_graph.empty else len(nodes_graph))
@@ -2590,43 +2778,4 @@ with tab_mapa:
             st.info("Todavia no hay conexiones.")
         else:
             st.dataframe(edges_graph.head(120), use_container_width=True)
-
-with tab_memoria:
-    st.markdown("## Memoria IA")
-
-    semillas_para_memoria = st.session_state.get(
-        "semillas_iniciales",
-        [k.strip().lower() for k in input_raw.split(",") if k.strip()]
-    )
-
-    prediccion_memoria = memoria.predict_opportunity(
-        semillas_para_memoria,
-        df_total,
-        color_patron,
-        ideas
-    )
-
-    if prediccion_memoria["score"] is None:
-        st.info(prediccion_memoria["motives"][0])
-    else:
-        c_mem1, c_mem2, c_mem3 = st.columns(3)
-
-        c_mem1.metric("Score memoria", f'{prediccion_memoria["score"]}/100')
-        c_mem2.metric("Lectura memoria", prediccion_memoria["label"])
-        c_mem3.metric("Confianza", prediccion_memoria["confidence"])
-
-        for motivo in prediccion_memoria["motives"]:
-            st.write(f"- {motivo}")
-
-        if prediccion_memoria["winning_patterns"]:
-            st.markdown("**Patrones historicos que empujan a favor:**")
-
-            for p in prediccion_memoria["winning_patterns"]:
-                st.write(f'- {format_pattern(p)} | peso {p["avg_weight"]:.2f} | usos {p["uses"]}')
-
-    st.markdown("### Ultimos analisis guardados")
-    st.dataframe(memoria.recent_analyses(10), use_container_width=True)
-
-    st.markdown("### Patrones ganadores historicos")
-    st.dataframe(memoria.leaderboard(30), use_container_width=True)
 
