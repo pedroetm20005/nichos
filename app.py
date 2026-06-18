@@ -1265,7 +1265,25 @@ def analizar_grafo_neural(nodes_df, edges_df):
     if nodes_df.empty or edges_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    node_ids = set(nodes_df["id"].astype(str).tolist())
+    nodes_clean = nodes_df.copy()
+    nodes_clean["id"] = nodes_clean["id"].astype(str)
+    nodes_clean["label"] = nodes_clean["label"].astype(str)
+    nodes_clean["type"] = nodes_clean["type"].astype(str)
+    nodes_clean["weight"] = pd.to_numeric(nodes_clean["weight"], errors="coerce").fillna(0)
+
+    # EVITA EL ERROR: "DataFrame index must be unique".
+    # Cuando se mezcla memoria historica + busqueda actual puede aparecer el mismo nodo varias veces.
+    nodes_clean = (
+        nodes_clean
+        .groupby("id", as_index=False)
+        .agg({
+            "label": "first",
+            "type": "first",
+            "weight": "sum"
+        })
+    )
+
+    node_ids = set(nodes_clean["id"].astype(str).tolist())
     adjacency = {node_id: Counter() for node_id in node_ids}
 
     for _, row in edges_df.iterrows():
@@ -1322,7 +1340,7 @@ def analizar_grafo_neural(nodes_df, edges_df):
             community_ids[community] = len(community_ids) + 1
 
     rows = []
-    node_meta = nodes_df.set_index("id").to_dict(orient="index")
+    node_meta = nodes_clean.set_index("id").to_dict(orient="index")
 
     for node, neighbors in adjacency.items():
         degree = len(neighbors)
@@ -2972,12 +2990,12 @@ def extract_current_search_graph(seeds, df_total, ideas, guiones_data, final_sco
 
 
 # Define tabs immediately
-tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_feed, tab_mapa = st.tabs([
+tab_outliers, tab_nicho, tab_ideas, tab_canales, tab_tendencia, tab_mapa = st.tabs([
     "Videos outliers",
     "Nicho",
     "Ideas validadas",
     "Canales validados",
-    "Feed recomendado",
+    "Tendencia",
     "Mapa neural"
 ])
 
@@ -3057,7 +3075,7 @@ with tab_outliers:
                 use_container_width=True
             )
     else:
-        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestana.")
 
 with tab_nicho:
     if search_active:
@@ -3142,7 +3160,7 @@ with tab_nicho:
             base_img = crear_base_miniatura(patron)
             st.image(base_img, caption="Miniatura base generada con el color dominante del nicho")
     else:
-        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestana.")
 
 with tab_ideas:
     if search_active:
@@ -3234,7 +3252,7 @@ with tab_ideas:
         else:
             st.info("No hay transcripciones disponibles en esta tanda.")
     else:
-        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestana.")
 
 with tab_canales:
     if search_active:
@@ -3249,22 +3267,92 @@ with tab_canales:
                 column_config={"Link": st.column_config.LinkColumn("Link")}
             )
     else:
-        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestana.")
 
-with tab_feed:
+with tab_tendencia:
     if search_active:
-        st.markdown("## Feed recomendado de los outliers")
+        st.markdown("## Tendencia")
         st.caption(
-            "Estos videos salen del feed lateral de YouTube alrededor de tus mejores outliers. "
-            "Son pistas de afinidad: hacia donde YouTube podria estar moviendo trafico dentro del nicho."
+            "Radar interno para ver formatos, temas y senales frescas del nicho solo cuando entras o haces una busqueda."
         )
 
         recommended_rows = st.session_state.get("recommended_data", [])
+        recommended_df = pd.DataFrame(recommended_rows).drop_duplicates(subset=["URL"]) if recommended_rows else pd.DataFrame()
+
+        tendencia_titles = df_total["Title"].astype(str).tolist()
+        if not recommended_df.empty and "Title" in recommended_df.columns:
+            tendencia_titles += recommended_df["Title"].astype(str).tolist()
+
+        formatos = Counter()
+        reglas_formatos = {
+            "100 days": r"\b100\s+days\b",
+            "secret / hidden": r"\b(secret|hidden|truth|nobody|no one)\b",
+            "explained / breakdown": r"\b(explained|breakdown|analysis)\b",
+            "vs / comparacion": r"\b(vs|versus|compared|comparison)\b",
+            "reto / challenge": r"\b(challenge|hardest|impossible|survive|survived)\b",
+            "historia / lore": r"\b(story|history|lore|timeline|rise|fall)\b",
+            "ranking / top": r"\b(top|best|ranking|tier)\b",
+            "build / hice": r"\b(i built|built|made|created)\b"
+        }
+
+        for titulo in tendencia_titles:
+            titulo_limpio = titulo.lower()
+            for nombre, patron in reglas_formatos.items():
+                if re.search(patron, titulo_limpio):
+                    formatos[nombre] += 1
+
+        texto_tendencia = re.sub(r"[^\w\s]", " ", " ".join(tendencia_titles).lower())
+        stop_tendencia = {
+            "the", "and", "for", "with", "from", "this", "that", "your", "you",
+            "how", "why", "what", "when", "video", "videos", "official", "full",
+            "new", "best", "top", "explained", "minecraft"
+        }
+        tokens_tendencia = [
+            token for token in texto_tendencia.split()
+            if token not in stop_tendencia and len(token) > 3
+        ]
+        temas_tendencia = Counter(tokens_tendencia).most_common(18)
+
+        c_t1, c_t2, c_t3, c_t4 = st.columns(4)
+        c_t1.metric("Outliers activos", len(df_total))
+        c_t2.metric("Recomendados detectados", 0 if recommended_df.empty else len(recommended_df))
+        c_t3.metric("Formatos detectados", len(formatos))
+        c_t4.metric("Temas fuertes", len(temas_tendencia))
+
+        c_fmt, c_topics = st.columns(2)
+        with c_fmt:
+            st.markdown("### Formatos calientes")
+            if formatos:
+                st.dataframe(
+                    pd.DataFrame(formatos.most_common(), columns=["Formato", "Senales"]),
+                    use_container_width=True
+                )
+            else:
+                st.info("Todavia no hay formatos claros en esta busqueda.")
+
+        with c_topics:
+            st.markdown("### Temas que mas se repiten")
+            if temas_tendencia:
+                st.dataframe(
+                    pd.DataFrame(temas_tendencia, columns=["Tema", "Veces"]),
+                    use_container_width=True
+                )
+            else:
+                st.info("Todavia no hay temas suficientes.")
+
+        st.markdown("### Lectura rapida")
+        if formatos:
+            formato_top, formato_count = formatos.most_common(1)[0]
+            st.success(f"Formato dominante ahora mismo: {formato_top} ({formato_count} senales).")
+        if temas_tendencia:
+            top_temas_txt = ", ".join([tema for tema, _ in temas_tendencia[:6]])
+            st.write(f"Temas que conviene vigilar: {top_temas_txt}.")
+
+        st.markdown("### Feed recomendado de los outliers")
 
         if not recommended_rows:
             st.info("No hay recomendados todavia. Sube 'Videos fuente para feed recomendado' y lanza otra busqueda.")
         else:
-            recommended_df = pd.DataFrame(recommended_rows).drop_duplicates(subset=["URL"])
             st.metric("Videos recomendados detectados", len(recommended_df))
 
             cols_feed = st.columns(3)
@@ -3273,7 +3361,7 @@ with tab_feed:
                     st.image(row.get("Thumbnail", ""), use_container_width=True)
                     st.markdown(f"**{row.get('Title', '')}**")
                     st.caption(
-                        f"{row.get('Channel', '')} · {int(row.get('Views', 0) or 0):,} views · "
+                        f"{row.get('Channel', '')} - {int(row.get('Views', 0) or 0):,} views - "
                         f"{row.get('Published', 'Unknown')}"
                     )
                     st.caption(f"Sale desde: {str(row.get('Source_Title', ''))[:90]}")
@@ -3282,7 +3370,7 @@ with tab_feed:
             with st.expander("Ver tabla completa del feed recomendado"):
                 st.dataframe(recommended_df, use_container_width=True)
     else:
-        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestaña.")
+        st.info("Escribe un nicho en el buscador de arriba y pulsa Buscar nicho para activar esta pestana.")
 
 with tab_mapa:
     st.markdown("## Mapa neural de memoria IA")
